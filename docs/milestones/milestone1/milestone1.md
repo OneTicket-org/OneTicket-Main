@@ -37,7 +37,7 @@ flowchart TB
 
     subgraph services - synchronous comms via internal RPCs
         direction LR
-        cat["<b>Catalogue</b><br/>venues, events, plans<br/>Spring"]
+        cat["<b>Catalogue</b><br/>venues, events<br/>Spring"]
         inv["<b>Inventory and orders</b><br/>holds, seats, orders<br/>Axum"]
         notif["<b>Notifications</b><br/>email, push<br/>Spring"]
         tick["<b>Ticketing</b><br/>issuance, gate scans<br/>Axum"]
