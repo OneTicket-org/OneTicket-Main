@@ -12,3 +12,9 @@
 - [docs/milestones/milestone1/milestone1.md](docs/milestones/milestone1/milestone1.md) — Milestone 1: domain scope, actors, user stories, service decomposition.
 - [docs/milestones/milestone2/data_ownership.md](docs/milestones/milestone2/data_ownership.md) — Milestone 2: which service owns which data.
 - [docs/milestones/milestone2/purchase_flow.md](docs/milestones/milestone2/purchase_flow.md) — Milestone 2: ticket purchase flow (sequence diagram).
+
+## Rules for agents
+
+- Precedence: `docs/constraints/` is binding. Milestone docs record decisions and history; a later milestone supersedes an earlier one. Constraints win over milestone docs; report any conflict instead of resolving it silently.
+- **TODO** rules are open points: never invent an answer for them. Flag the gap, or propose an ADR.
+- Cite rules by ID (e.g. `[API-07]`) in code comments, reviews and ADRs. IDs are stable; see [docs/constraints/README.md](docs/constraints/README.md) for the scheme.
