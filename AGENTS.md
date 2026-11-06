@@ -19,3 +19,7 @@
 - Precedence: `docs/constraints/` is binding. Milestone docs record decisions and history; a later milestone supersedes an earlier one. Constraints win over milestone docs; report any conflict instead of resolving it silently.
 - **TODO** rules are open points: never invent an answer for them. Flag the gap, or propose an ADR.
 - Cite rules by ID (e.g. `[API-07]`) in code comments, reviews and ADRs. IDs are stable; see [docs/constraints/README.md](docs/constraints/README.md) for the scheme.
+
+## Service repositories
+
+Each service lives in its own repository; links are listed in [README.md](README.md#service-repositories).

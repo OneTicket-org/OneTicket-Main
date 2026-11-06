@@ -1,0 +1,15 @@
+[submodule "services/catalogue"]
+	path = services/catalogue
+	url = https://github.com/OneTicket-org/OneTicket-Catalogue.git
+[submodule "services/inventory-orders"]
+	path = services/inventory-orders
+	url = https://github.com/OneTicket-org/OneTicket-InventoryOrders.git
+[submodule "services/ticketing"]
+	path = services/ticketing
+	url = https://github.com/OneTicket-org/OneTicket-Ticketing.git
+[submodule "services/payments"]
+	path = services/payments
+	url = https://github.com/OneTicket-org/OneTicket-Payments.git
+[submodule "services/notifications"]
+	path = services/notifications
+	url = https://github.com/OneTicket-org/OneTicket-Notifications.git
