@@ -10,7 +10,7 @@
 | **INFO**   | Useful fact: sizing figures, versions, scope notes                                                                                             |
 | **TODO**   | Open point, still to be defined                                                                                                                |
 
-Each rule carries a stable ID (`[API-07]`): prefix by file (`ARCH` this file, `BIZ`, `SVC`, `API`, `OPS`, `SEC`), number unique within the prefix. IDs never change or get reused: new rules take the next free number, removed rules leave a gap, moved rules keep their ID.
+Each rule carries a stable ID (`[API-07]`): prefix by file (`ARCH` this file, `BIZ`, `SVC`, `API`, `OPS`, `SEC`, `STY`), number unique within the prefix. IDs never change or get reused: new rules take the next free number, removed rules leave a gap, moved rules keep their ID.
 
 ## Project specifications
 
@@ -49,7 +49,7 @@ Each rule carries a stable ID (`[API-07]`): prefix by file (`ARCH` this file, `B
 
 ### Mandated infrastructure & toolchains
 
-- **SHOULD** [ARCH-25] Stack 1: Kotlin 2.3 (baseline of Spring Boot 4.1), Spring Boot 4.1, Spring Framework 7, JDK 25, Gradle with the Kotlin DSL (`build.gradle.kts`)
+- **MUST** [ARCH-25] Stack 1: Kotlin 2.3 (baseline of Spring Boot 4.1), Spring Boot 4.1, Spring Framework 7, JDK 25, Gradle with the Kotlin DSL (`build.gradle.kts`)
 - **SHOULD** [ARCH-26] Stack 2: Rust stable, edition 2024, Axum 0.8, Tokio 1.53, SQLx 0.9 (course `Cargo.toml` also pins serde 1, thiserror 2, tracing 0.1)
 - **SHOULD** [ARCH-27] Shared infrastructure: PostgreSQL 18, Keycloak 26.7, Redis, RabbitMQ or Kafka, RustFS (object storage), Prometheus and Grafana, run by a single course `docker-compose.yaml` enabled step by step
 - **SHOULD** [ARCH-28] Rust CI runs `cargo fmt --check`, `cargo audit` and `cargo deny` (CVEs and licence policy) besides clippy `cargo clippy -D warnings`
@@ -62,3 +62,4 @@ Each rule carries a stable ID (`[API-07]`): prefix by file (`ARCH` this file, `B
 - [http-api.md](http-api.md) — HTTP API design & contracts, request parsing
 - [operations.md](operations.md) — resilience, performance & capacity, observability, configuration
 - [security.md](security.md) — authentication
+- [code-style.md](code-style.md) — Kotlin/Spring and Rust/Axum code conventions, testing & CI

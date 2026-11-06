@@ -49,7 +49,7 @@ stateDiagram-v2
 - **DOMAIN** [BIZ-20] Ticket issuance follows payment eventually; "order paid and ticket issued" cannot be one cross-service transaction and requires an outbox or saga
 - **DOMAIN** [BIZ-21] Confirmation e-mail, PDF ticket rendering and dashboard updates are deferrable; their failure does not invalidate the order
 - **MUST** [BIZ-22] Money in business logic is amount + currency (ISO 4217 format) in exact form, never floating point: `Money(amount: BigDecimal, currency: Currency)` in Kotlin, `rust_decimal` crate in Rust
-- **MUST** [BIZ-23] Money in storage uses a `NUMERIC` column, with an implicit currency of EUR. Incoming values with currencies other than EUR are automatically converted by business logic
+- **MUST** [BIZ-23] Money in storage is a `NUMERIC(12,2)` amount column plus an ISO 4217 currency column
 - **MUST** [BIZ-24] Money on the wire is an object with a string amount and an ISO 4217 currency code: `{"amount": "45.10", "currency": "EUR"}`
 
 ### Tickets validation

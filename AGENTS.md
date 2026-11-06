@@ -8,6 +8,7 @@
   - [http-api.md](docs/constraints/http-api.md) — URIs, methods/status codes, idempotency, caching, pagination, headers, request parsing. Read when designing/implementing endpoints.
   - [operations.md](docs/constraints/operations.md) — resilience, performance & capacity, observability, configuration. Read for NFR/infra/deployment work.
   - [security.md](docs/constraints/security.md) — authentication. Read for auth work.
+  - [code-style.md](docs/constraints/code-style.md) — Kotlin/Spring and Rust/Axum conventions, testing & CI. Read when writing, reviewing or testing code.
 - [docs/glossary.md](docs/glossary.md) — domain terms.
 - [docs/milestones/milestone1/milestone1.md](docs/milestones/milestone1/milestone1.md) — Milestone 1: domain scope, actors, user stories, service decomposition.
 - [docs/milestones/milestone2/data_ownership.md](docs/milestones/milestone2/data_ownership.md) — Milestone 2: which service owns which data.
