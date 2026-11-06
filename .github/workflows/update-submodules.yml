@@ -1,0 +1,61 @@
+# Moves every service submodule to the latest commit on its `main` branch.
+# Triggered by the `notify-main.yml` workflow of each service repository after
+# a merge to its `main`, or manually from the Actions tab.
+name: Update service submodules
+
+on:
+  repository_dispatch:
+    types: [service-updated]
+  workflow_dispatch:
+
+# Serialize runs: concurrent merges in different services would otherwise race
+# on the push. Each run picks up whatever is latest, so queued runs are cheap.
+concurrency:
+  group: update-submodules
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      # GITHUB_TOKEN cannot read the other org repositories nor trigger
+      # workflows; an org-owned GitHub App token can do both.
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.SUBMODULE_BOT_APP_ID }}
+          private-key: ${{ secrets.SUBMODULE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Check out repository with submodules
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          submodules: true
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Update submodules to latest main
+        run: git submodule update --remote
+
+      - name: Commit and push new pointers
+        env:
+          TRIGGER: ${{ github.event.client_payload.service || 'manual run' }}
+        run: |
+          changed=$(git diff --name-only)
+          if [ -z "$changed" ]; then
+            echo "Submodules already up to date."
+            exit 0
+          fi
+          git config user.name "oneticket-submodule-bot[bot]"
+          git config user.email "oneticket-submodule-bot[bot]@users.noreply.github.com"
+          git add $changed
+          summary=$(git submodule summary --cached)
+          git commit \
+            -m "Update submodules: $(echo $changed | sed 's#services/##g')" \
+            -m "Triggered by: $TRIGGER" \
+            -m "$summary"
+          git push origin HEAD:main
