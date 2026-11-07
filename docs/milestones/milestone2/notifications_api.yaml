@@ -1,0 +1,783 @@
+openapi: 3.1.0
+info:
+  title: OneTicket Notifications API
+  version: 0.1.0-draft
+  summary: Internal tracking of the confirmation, ticket and refund emails sent to customers.
+  description: |
+    Draft contract of the Notifications service (Kotlin/Spring Boot). The service sends the order
+    confirmation email, the ticket email and the refund confirmation email to customers, and owns the
+    email tracking data.
+
+    ## How emails are sent
+
+    Sending is never requested over HTTP: everything after payment is asynchronous ([ARCH-16]).
+
+    - **Order confirmation** (`ORDER_CONFIRMATION`): sent when the message announcing a PAID order is
+      received.
+    - **Tickets** (`TICKETS`): sent when the message announcing the order's issued tickets is received,
+      with the ticket PDFs attached, read from object storage ([ARCH-19]).
+    - **Refund confirmation** (`REFUND_CONFIRMATION`): sent when the message announcing a succeeded
+      refund is received from Payments, once the money is returned and the order is REFUNDED
+      ([BIZ-07], [BIZ-14]); it states the refunded amount and that the order's tickets are no longer
+      valid.
+
+    Each message creates one email record, QUEUED. The recipient address is resolved at send time from
+    the customer's Keycloak account (`customerId` is the Keycloak `sub`), through the Keycloak admin API
+    with the service's own service account (allowed to view users only). Addresses are never stored in
+    other services nor returned by this API. Sending is deferrable work: a failure is retried with
+    backoff and never invalidates the order ([BIZ-21]); after the configured number of attempts
+    ([OPS-26]) the email becomes FAILED. A message delivered twice creates no second email: emails are
+    deduplicated by type and order.
+
+    ## Internal API
+
+    Every operation is reserved to platform services: it requires a client-credentials token with the
+    `service` role and rejects end-user tokens ([ARCH-31]). No route of this service is exposed by the
+    edge. The API lets services inspect emails and their delivery status, and queue an email again.
+
+    ## Conventions
+
+    - **Base path**: every operation is mounted once under `/api/v1` ([API-10]); the API version is
+      carried by the URI.
+    - **Authentication**: Keycloak-issued bearer JWT with the `service` role ([SEC-03], [SEC-05],
+      [ARCH-31]).
+    - **Errors**: `application/problem+json` (RFC 9457) carrying a stable `code` ([API-04], [STY-79]).
+    - **Idempotency**: every `POST` requires an `Idempotency-Key` (a UUID generated once per logical
+      operation and reused on each retry of it) ([API-23], [API-24]). A finished key replays the stored
+      status and body without re-executing; a key still executing answers `409 IDEMPOTENCY_KEY_IN_USE`;
+      a key reused with a different method, URI or body answers `422 IDEMPOTENCY_KEY_REUSED`
+      ([API-25], [API-26]). Keys are retained for 24 hours (set in configuration [OPS-26]): a retry
+      is safe within that window ([API-27]).
+    - **Pagination**: cursor (keyset) pagination with the envelope `{items, nextCursor, limit}`
+      ([API-35], [API-38]). `limit` defaults to 50 and is clamped to 200 (set in configuration
+      [OPS-26]); the served value is echoed in `limit` ([API-37]). The cursor is opaque
+      ([API-36]), bound to the filters and sort it was issued for, and `nextCursor` is `null` on the
+      last page. Collections report no total count ([API-39]).
+    - **Concurrency**: emails carry a row version exposed as a strong `ETag`; reads accept
+      `If-None-Match` and answer `304` when unchanged ([API-32], [API-34]). Callers never write emails
+      directly, so no operation takes `If-Match`.
+    - **Caching**: emails concern a customer's orders and are `Cache-Control: no-store` ([API-30]).
+    - **Strictness**: timestamps are ISO 8601 with an explicit UTC offset, timestamps without offset are
+      rejected ([API-05]).
+    - **Correlation**: `X-Request-Id` is reused from the request or generated, and returned on every
+      response ([OPS-12]).
+    - **Overload**: `429` and `503` carry `Retry-After` ([API-19], [API-46]).
+
+    ## Not covered by this draft
+
+    The messages that trigger emails (order paid, tickets issued, refund succeeded; [ARCH-16]), email
+    templates and languages, the mail server, the retry policy values (**TODO** [OPS-05]), emails for
+    cancelled orders or failed refunds (not requested), push notifications (listed in milestone 1, not
+    requested), health endpoints (outside `/api/v1`, [API-10]).
+
+servers:
+  - url: /api/v1
+    description: Version 1 of the API, mounted once ([API-10]); internal only, not routed by the edge ([ARCH-31]).
+
+security:
+  - bearerAuth: [service]
+
+tags:
+  - name: Emails
+    description: Confirmation, ticket and refund emails sent to customers, with their delivery status.
+
+paths:
+  /emails:
+    get:
+      operationId: listEmails
+      tags: [Emails]
+      summary: List emails
+      description: |
+        Service operation ([ARCH-31]). Returns one page of emails matching the filters, newest first by
+        default. All filters are optional and combine with AND. Filters: `orderId`, `customerId`,
+        `type`, `status`. Sort fields: `createdAt` (whitelist, [API-35]); ties are broken by ascending
+        email `id`.
+      parameters:
+        - name: orderId
+          in: query
+          required: false
+          description: Return only the emails about this order.
+          schema:
+            $ref: '#/components/schemas/OrderId'
+          example: 5512
+        - name: customerId
+          in: query
+          required: false
+          description: Return only the emails sent to this customer.
+          schema:
+            $ref: '#/components/schemas/CustomerId'
+          example: b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+        - name: type
+          in: query
+          required: false
+          description: Return only emails of this type.
+          schema:
+            $ref: '#/components/schemas/EmailType'
+          example: TICKETS
+        - name: status
+          in: query
+          required: false
+          description: Return only emails in this status.
+          schema:
+            $ref: '#/components/schemas/EmailStatus'
+          example: FAILED
+        - name: sort
+          in: query
+          required: false
+          description: Sort field; a leading `-` sorts descending. A cursor is bound to the sort it was issued for.
+          schema:
+            type: string
+            enum: [createdAt, -createdAt]
+            default: -createdAt
+          example: -createdAt
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: One page of emails.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmailPage'
+              example:
+                items:
+                  - id: 20913
+                    type: REFUND_CONFIRMATION
+                    orderId: 5512
+                    customerId: b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+                    ticketIds: []
+                    refundId: rfd_01J9A7K2XQ
+                    status: SENT
+                    attempts: 1
+                    resendOf: null
+                    createdAt: '2029-09-01T20:58:43+02:00'
+                    sentAt: '2029-09-01T20:58:44+02:00'
+                    failedAt: null
+                    failureReason: null
+                  - id: 20871
+                    type: TICKETS
+                    orderId: 5512
+                    customerId: b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+                    ticketIds:
+                      - 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c
+                    refundId: null
+                    status: SENT
+                    attempts: 1
+                    resendOf: null
+                    createdAt: '2029-09-01T20:55:02+02:00'
+                    sentAt: '2029-09-01T20:55:04+02:00'
+                    failedAt: null
+                    failureReason: null
+                  - id: 20864
+                    type: ORDER_CONFIRMATION
+                    orderId: 5512
+                    customerId: b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+                    ticketIds: []
+                    refundId: null
+                    status: SENT
+                    attempts: 1
+                    resendOf: null
+                    createdAt: '2029-09-01T20:54:12+02:00'
+                    sentAt: '2029-09-01T20:54:13+02:00'
+                    failedAt: null
+                    failureReason: null
+                nextCursor: null
+                limit: 50
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ServiceForbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /emails/{emailId}:
+    get:
+      operationId: getEmail
+      tags: [Emails]
+      summary: Get an email
+      description: |
+        Service operation ([ARCH-31]). Returns the email with its delivery status. `If-None-Match`
+        answers `304` when the email is unchanged.
+      parameters:
+        - $ref: '#/components/parameters/EmailId'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The email.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Email'
+              example:
+                id: 20871
+                type: TICKETS
+                orderId: 5512
+                customerId: b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+                ticketIds:
+                  - 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c
+                refundId: null
+                status: FAILED
+                attempts: 5
+                resendOf: null
+                createdAt: '2029-09-01T20:55:02+02:00'
+                sentAt: null
+                failedAt: '2029-09-01T21:25:40+02:00'
+                failureReason: MAIL_SERVER_UNAVAILABLE
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ServiceForbidden'
+        '404':
+          $ref: '#/components/responses/EmailNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /emails/{emailId}/resends:
+    post:
+      operationId: resendEmail
+      tags: [Emails]
+      summary: Queue an email again
+      description: |
+        Service operation ([ARCH-31]). Queues a new copy of a SENT or FAILED email, e.g. when the
+        customer did not receive it or sending gave up. The copy is a new email record with its own
+        `id`, `resendOf` pointing at the original, whose own record is left unchanged. Sending is
+        deferred: the response is `202` with the QUEUED copy, whose progress is observed at `Location`
+        ([API-17]). The recipient address and the ticket attachments are resolved again at send time.
+
+        An email still QUEUED, or one with a QUEUED copy, cannot be resent: `409 EMAIL_ALREADY_QUEUED`.
+      parameters:
+        - $ref: '#/components/parameters/EmailId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '202':
+          description: The copy is QUEUED for sending.
+          headers:
+            Location:
+              $ref: '#/components/headers/EmailLocation'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Email'
+              example:
+                id: 20902
+                type: TICKETS
+                orderId: 5512
+                customerId: b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+                ticketIds:
+                  - 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c
+                refundId: null
+                status: QUEUED
+                attempts: 0
+                resendOf: 20871
+                createdAt: '2029-09-01T21:40:00+02:00'
+                sentAt: null
+                failedAt: null
+                failureReason: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ServiceForbidden'
+        '404':
+          $ref: '#/components/responses/EmailNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: The email is still being sent, or the same request is still executing.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                emailAlreadyQueued:
+                  summary: The email or a copy of it is still QUEUED
+                  value:
+                    type: /problems/email-already-queued
+                    title: Email already queued
+                    status: 409
+                    detail: Email 20871 has a copy still queued (20902).
+                    instance: /api/v1/emails/20871/resends
+                    code: EMAIL_ALREADY_QUEUED
+                idempotencyKeyInUse:
+                  $ref: '#/components/examples/IdempotencyKeyInUse'
+        '422':
+          description: The idempotency key was already used for a different request.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                idempotencyKeyReused:
+                  $ref: '#/components/examples/IdempotencyKeyReused'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Keycloak-issued access token, verified by signature on every request ([SEC-02], [SEC-03]).
+        Every operation requires the `service` role of client-credentials tokens ([ARCH-31]).
+
+  parameters:
+    EmailId:
+      name: emailId
+      in: path
+      required: true
+      description: Identifier of the email.
+      schema:
+        $ref: '#/components/schemas/EmailId'
+      example: 20871
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Requested page size; the server clamps it to 200 and echoes the served value in `limit`.
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        default: 50
+      example: 50
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from the `nextCursor` of the previous page; omit it for the first page. Never parse or build it.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+      example: MjAyOS0wOS0wMXwyMDg2NA
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID identifying one logical operation, reused on every retry of it ([API-24]); retained for 24 hours.
+      schema:
+        type: string
+        format: uuid
+      example: 5f0c1c1e-3f4b-4f43-9d7e-2b8a3c7d9e10
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: ETag of the representation held by the caller; the server answers 304 if it still matches.
+      schema:
+        type: string
+      example: '"v3"'
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Correlation id of the request; generated by the server when absent and returned on the response ([OPS-12]).
+      schema:
+        type: string
+        maxLength: 128
+      example: 0b6f3c4e-8a2d-4c1f-9e7b-5d3a2f1c0e9d
+
+  headers:
+    RequestId:
+      description: Correlation id of the request, reused from the request or generated ([OPS-12]).
+      schema:
+        type: string
+      example: 0b6f3c4e-8a2d-4c1f-9e7b-5d3a2f1c0e9d
+    ETag:
+      description: Strong entity tag carrying the row version of the email.
+      schema:
+        type: string
+      example: '"v3"'
+    EmailLocation:
+      description: URI of the queued copy, where its progress is observed ([API-17]).
+      schema:
+        type: string
+        format: uri-reference
+      example: /api/v1/emails/20902
+    CacheControlNoStore:
+      description: The response must not be stored by any cache ([API-30]).
+      schema:
+        type: string
+        const: no-store
+      example: no-store
+    RetryAfter:
+      description: Seconds the caller should wait before retrying, with backoff ([API-46]).
+      schema:
+        type: integer
+        minimum: 0
+      example: 5
+
+  schemas:
+    EmailId:
+      description: Identifier of an email record, assigned by Notifications.
+      type: integer
+      format: int64
+      minimum: 1
+    OrderId:
+      description: Identifier of an order, assigned by Inventory & Orders.
+      type: integer
+      format: int64
+      minimum: 1
+    CustomerId:
+      description: Keycloak subject (`sub` claim) of the customer; the recipient address is resolved from it at send time.
+      type: string
+      format: uuid
+    TicketId:
+      description: Identifier of a ticket, assigned by Ticketing.
+      type: string
+      format: uuid
+    RefundId:
+      description: Identifier of a refund, assigned by Payments.
+      type: string
+      pattern: '^rfd_[0-9A-Z]{10,26}$'
+
+    Timestamp:
+      description: ISO 8601 timestamp with an explicit UTC offset ([API-05]).
+      type: string
+      format: date-time
+
+    EmailType:
+      description: |
+        Kind of email. ORDER_CONFIRMATION confirms a PAID order; TICKETS delivers the order's tickets as
+        PDF attachments; REFUND_CONFIRMATION confirms that a REFUNDED order's money was returned.
+      type: string
+      enum: [ORDER_CONFIRMATION, TICKETS, REFUND_CONFIRMATION]
+
+    EmailStatus:
+      description: |
+        Delivery state of an email. QUEUED waits to be sent or to be retried; SENT was accepted by the
+        mail server (delivery to the inbox is not tracked); FAILED gave up after the configured number
+        of attempts or on a permanent error. Only QUEUED -> SENT and QUEUED -> FAILED are legal; a
+        resend creates a new email.
+      type: string
+      enum: [QUEUED, SENT, FAILED]
+
+    FailureReason:
+      description: |
+        Why an email is FAILED. RECIPIENT_NOT_FOUND: the customer has no Keycloak account or no address;
+        RECIPIENT_REJECTED: the mail server refused the address; ATTACHMENT_UNAVAILABLE: a ticket PDF
+        could not be read from object storage; MAIL_SERVER_UNAVAILABLE: attempts exhausted while the
+        mail server or Keycloak was unreachable.
+      type: string
+      enum: [RECIPIENT_NOT_FOUND, RECIPIENT_REJECTED, ATTACHMENT_UNAVAILABLE, MAIL_SERVER_UNAVAILABLE]
+
+    Email:
+      description: One email sent, or to be sent, to a customer about an order. The recipient address is never returned.
+      type: object
+      required:
+        [id, type, orderId, customerId, ticketIds, refundId, status, attempts, resendOf, createdAt, sentAt, failedAt, failureReason]
+      properties:
+        id:
+          $ref: '#/components/schemas/EmailId'
+        type:
+          $ref: '#/components/schemas/EmailType'
+        orderId:
+          $ref: '#/components/schemas/OrderId'
+        customerId:
+          $ref: '#/components/schemas/CustomerId'
+        ticketIds:
+          description: Tickets attached to a TICKETS email; empty for the other types.
+          type: array
+          items:
+            $ref: '#/components/schemas/TicketId'
+        refundId:
+          description: Refund confirmed by a REFUND_CONFIRMATION email; `null` for the other types.
+          oneOf:
+            - $ref: '#/components/schemas/RefundId'
+            - type: 'null'
+        status:
+          $ref: '#/components/schemas/EmailStatus'
+        attempts:
+          description: Number of sending attempts made so far.
+          type: integer
+          format: int32
+          minimum: 0
+        resendOf:
+          description: Email this one is a copy of; `null` for an email created by a message.
+          oneOf:
+            - $ref: '#/components/schemas/EmailId'
+            - type: 'null'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the email was queued.
+        sentAt:
+          description: When the mail server accepted the email; `null` unless SENT.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        failedAt:
+          description: When sending gave up; `null` unless FAILED.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        failureReason:
+          description: Why sending gave up; `null` unless FAILED.
+          oneOf:
+            - $ref: '#/components/schemas/FailureReason'
+            - type: 'null'
+
+    EmailPage:
+      description: One page of emails.
+      type: object
+      required: [items, nextCursor, limit]
+      properties:
+        items:
+          description: Emails of this page, in the requested sort order.
+          type: array
+          items:
+            $ref: '#/components/schemas/Email'
+        nextCursor:
+          description: Cursor of the next page; `null` on the last page.
+          type: [string, 'null']
+        limit:
+          description: Page size served after clamping.
+          type: integer
+          format: int32
+
+    Problem:
+      description: |
+        RFC 9457 problem document, the single error format of the platform ([API-04]). `code` is a
+        stable machine-readable identifier that never changes once published ([STY-79]).
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type:
+          description: URI reference identifying the problem type.
+          type: string
+          format: uri-reference
+        title:
+          description: Short human-readable summary of the problem type.
+          type: string
+        status:
+          description: HTTP status code of the response.
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          description: Human-readable explanation of this occurrence.
+          type: string
+        instance:
+          description: URI reference of the request that produced the problem.
+          type: string
+          format: uri-reference
+        code:
+          description: Stable error code.
+          type: string
+
+  examples:
+    IdempotencyKeyInUse:
+      summary: A request with the same Idempotency-Key is still executing
+      value:
+        type: /problems/idempotency-key-in-use
+        title: Idempotency key in use
+        status: 409
+        detail: A request with this Idempotency-Key is still being processed; retry later.
+        instance: /api/v1/emails/20871/resends
+        code: IDEMPOTENCY_KEY_IN_USE
+    IdempotencyKeyReused:
+      summary: The Idempotency-Key was used for a different request
+      value:
+        type: /problems/idempotency-key-reused
+        title: Idempotency key reused
+        status: 422
+        detail: This Idempotency-Key was already used with a different request.
+        instance: /api/v1/emails/20871/resends
+        code: IDEMPOTENCY_KEY_REUSED
+
+  responses:
+    NotModified:
+      description: The representation is unchanged since the ETag sent in `If-None-Match`; empty body ([API-32]).
+      headers:
+        ETag:
+          $ref: '#/components/headers/ETag'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+    BadRequest:
+      description: The request cannot be parsed (wrong parameter type, unknown enum value, invalid cursor).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/malformed-request
+            title: Malformed request
+            status: 400
+            detail: Query parameter status must be one of QUEUED, SENT, FAILED.
+            instance: /api/v1/emails
+            code: MALFORMED_REQUEST
+    Unauthorized:
+      description: The bearer token is missing or invalid ([SEC-06]).
+      headers:
+        WWW-Authenticate:
+          description: Authentication challenge for the bearer scheme.
+          schema:
+            type: string
+          example: Bearer
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/unauthenticated
+            title: Unauthenticated
+            status: 401
+            detail: A valid bearer token is required.
+            instance: /api/v1/emails
+            code: UNAUTHENTICATED
+    ServiceForbidden:
+      description: The token is valid but does not carry the `service` role; end-user tokens are rejected ([ARCH-31], [SEC-06]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/forbidden
+            title: Forbidden
+            status: 403
+            detail: This operation is reserved to platform services.
+            instance: /api/v1/emails
+            code: FORBIDDEN
+    EmailNotFound:
+      description: The email does not exist.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/email-not-found
+            title: Email not found
+            status: 404
+            detail: Email 20871 does not exist.
+            instance: /api/v1/emails/20871
+            code: EMAIL_NOT_FOUND
+    NotAcceptable:
+      description: The `Accept` header allows no media type this operation produces ([API-43]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/not-acceptable
+            title: Not acceptable
+            status: 406
+            detail: This operation produces application/json.
+            instance: /api/v1/emails
+            code: NOT_ACCEPTABLE
+    TooManyRequests:
+      description: The caller exceeded its rate limit; retry after `Retry-After` seconds ([API-18], [API-46]).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/rate-limited
+            title: Too many requests
+            status: 429
+            detail: Rate limit exceeded; retry later.
+            instance: /api/v1/emails
+            code: RATE_LIMITED
+    InternalServerError:
+      description: Unexpected server failure; details are logged with the correlation id, not returned ([OPS-17]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/internal-error
+            title: Internal server error
+            status: 500
+            detail: An unexpected error occurred.
+            instance: /api/v1/emails
+            code: INTERNAL_ERROR
+    ServiceUnavailable:
+      description: The service is shedding load or its database is unavailable; retry after `Retry-After` seconds ([API-19], [OPS-02]).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/service-unavailable
+            title: Service unavailable
+            status: 503
+            detail: The service is overloaded; retry later.
+            instance: /api/v1/emails
+            code: SERVICE_UNAVAILABLE

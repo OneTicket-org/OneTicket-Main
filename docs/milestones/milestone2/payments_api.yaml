@@ -18,8 +18,9 @@ info:
        ([BIZ-13]).
 
     Refunds cover a whole order ([BIZ-14]): the customer requests one with `requestRefund`, Payments
-    executes it at the PSP asynchronously, and on success notifies Inventory & Orders, which applies
-    `PAID -> REFUNDED` and frees the seats ([BIZ-07]).
+    executes it at the PSP asynchronously, and on success publishes a message consumed by Inventory &
+    Orders, which applies `PAID -> REFUNDED` and frees the seats ([BIZ-07]), and by Notifications,
+    which emails the refund confirmation.
 
     ## Conventions
 
@@ -53,9 +54,10 @@ info:
 
     ## Not covered by this draft
 
-    The asynchronous messages to Inventory & Orders (payment succeeded / failed, refund succeeded;
-    [ARCH-16]), the payment timeout value (set in configuration, [OPS-26]), a payment that succeeds at
-    the PSP after its hold expired or its order was cancelled (**TODO** [BIZ-10], [BIZ-28]), refund
+    The asynchronous messages to Inventory & Orders and Notifications (payment succeeded / failed,
+    refund succeeded; [ARCH-16]), the payment timeout value (set in configuration, [OPS-26]), a payment
+    that succeeds at the PSP after its hold expired or its order was cancelled (**TODO** [BIZ-10],
+    [BIZ-28]), refund
     eligibility (**TODO** [BIZ-29]), where processed webhook identifiers and idempotency keys are stored
     (**TODO** [BIZ-19]), the exact PSP signature scheme and event payload (they follow the PSP
     sandbox, [ADR-0003](../../adr/0003-psp-webhook-authentication.md)), refunds of single tickets,
