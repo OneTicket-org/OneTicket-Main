@@ -11,6 +11,9 @@ Tags (**MUST**, **SHOULD**, **DOMAIN**, **INFO**, **TODO**): see [README.md](REA
 - **MUST** [API-03] OpenAPI style rules enforced at project review: every operation has an `operationId`, every schema and parameter has a `description`, every response carries an `example`
 - **MUST** [API-04] All services use a single error format, RFC 9457 problem documents, in both stacks, and the SPA parses that single format
 - **MUST** [API-05] Timestamps are ISO 8601 with an explicit UTC offset (`OffsetDateTime`, e.g. `2026-09-01T21:00:00+02:00`); timestamps without offset are rejected in requests
+- **MUST** [API-54] Countries are ISO 3166-1 alpha-2 codes (e.g. `IT`) in a property or parameter named `country`, never `nation` or a free-text name; any other value is rejected in requests
+- **MUST** [API-55] An event's start time (`startsAt`) is expressed in the local time of its venue: the UTC offset is the one in force at the venue at that instant, derived from the venue's IANA time zone (e.g. `2029-09-01T21:00:00+02:00` for Turin in summer, `+01:00` in winter); requests may carry any explicit offset ([API-05]), the server stores the instant and every response showing the start time uses the venue's offset
+- **MUST** [API-56] Clients convert event times for display themselves: `startsAt` is shown in the venue's local time (the offset it carries per [API-55], labelled with the venue's `timeZone`), `salesOpenAt` in the client's own time zone; the API returns timestamps only, never pre-formatted local times, and clients never rely on the offset `salesOpenAt` carries
 
 ### Resources & URIs
 

@@ -1,0 +1,1473 @@
+openapi: 3.1.0
+info:
+  title: OneTicket Catalogue API
+  version: 0.1.0-draft
+  summary: Events and venues of the OneTicket platform.
+  description: |
+    Draft contract of the Catalogue service (Kotlin/Spring Boot). The service owns events and venues:
+    descriptive data, sales opening time and, later, venue seating plans and price tiers. Seat
+    inventory, holds and orders belong to Inventory & Orders
+    ([ADR-0001](../../adr/0001-seat-inventory-placement.md)).
+
+    ## Conventions
+
+    - **Base path**: every operation is mounted once under `/api/v1` ([API-10]); the API version is
+      carried by the URI.
+    - **Authentication**: Keycloak-issued bearer JWT ([SEC-03], [SEC-05]). Keycloak roles are
+      `customer`, `organizer` and `gate-staff` ([ARCH-30]); the global requirement is the `organizer`
+      role, overridden per operation. Event and venue reads are public: no token required
+      ([ADR-0002](../../adr/0002-public-seat-map.md)).
+    - **Ownership**: an organizer modifies or deletes only the events they created; another
+      organizer's event answers `403 EVENT_NOT_OWNED` (events are public, so nothing is hidden behind
+      a `404`, [API-18]).
+    - **Errors**: `application/problem+json` (RFC 9457) carrying a stable `code` ([API-04], [STY-79]);
+      `422` bodies list field errors as `{field, code, detail}` ([STY-20]).
+    - **Idempotency**: every `POST` requires an `Idempotency-Key` (a UUID generated once per logical
+      operation and reused on each retry of it) ([API-23], [API-24]). A finished key replays the stored
+      status and body without re-executing; a key still executing answers `409 IDEMPOTENCY_KEY_IN_USE`;
+      a key reused with a different method, URI or body answers `422 IDEMPOTENCY_KEY_REUSED`
+      ([API-25], [API-26]). Keys are retained for 24 hours (set in configuration [OPS-26]): a retry
+      is safe within that window ([API-27]).
+    - **Pagination**: cursor (keyset) pagination with the envelope `{items, nextCursor, limit}`
+      ([API-35], [API-38]). `limit` defaults to 50 and is clamped to 200 (set in configuration
+      [OPS-26]); the served value is echoed in `limit` ([API-37]). The cursor is opaque
+      ([API-36]), bound to the filters and sort it was issued for, and `nextCursor` is `null` on the
+      last page. Collections report no total count ([API-39]).
+    - **Concurrency**: events and venues carry a row version exposed as a strong `ETag`. Writes accept
+      `If-Match` and answer `412` when it is stale ([API-33]); reads accept `If-None-Match` and answer
+      `304` when unchanged ([API-32], [API-34]).
+    - **Caching**: event and venue reads are public and cacheable for minutes
+      (`Cache-Control: public, max-age=300`, [API-31]).
+    - **Strictness**: request bodies reject unknown fields and implicit type coercion ([API-51],
+      [API-52]); timestamps are ISO 8601 with an explicit UTC offset, timestamps without offset are
+      rejected ([API-05]). In query strings the `+` of an offset must be percent-encoded (`%2B`).
+      Countries are ISO 3166-1 alpha-2 codes ([API-54]). An event's `startsAt` is always returned in
+      the local time of its venue, i.e. with the UTC offset in force there ([API-55]).
+    - **Displaying event times**: clients convert for display themselves ([API-56]). `startsAt` is
+      shown in the venue's local time, i.e. as returned, labelled with the venue's `timeZone`;
+      `salesOpenAt` is an instant shown in the client's own time zone, whatever offset it carries.
+    - **Correlation**: `X-Request-Id` is reused from the request or generated, and returned on every
+      response ([OPS-12]).
+    - **Overload**: `429` and `503` carry `Retry-After` ([API-19], [API-46]); public reads are
+      rate-limited per client ([ADR-0002](../../adr/0002-public-seat-map.md)).
+
+    ## Not covered by this draft
+
+    Venue seating plans and event price tiers (Catalogue data per ADR-0001; pricing rules are open,
+    **TODO** [ARCH-03]), seat inventory set-up in Inventory & Orders and propagation of event changes
+    and deletions to it (mechanism open, ADR-0001), the remaining organizer rules for event creation
+    (**TODO** [ARCH-03]), venue updates and deletion, health endpoints (outside `/api/v1`, [API-10]).
+    Seat maps, the seat stream and holds are Inventory & Orders operations (ADR-0001).
+
+servers:
+  - url: /api/v1
+    description: Version 1 of the API, mounted once ([API-10]).
+
+security:
+  - bearerAuth: [organizer]
+
+tags:
+  - name: Events
+    description: Events published by organizers, with their venue, start time and sales opening time.
+  - name: Venues
+    description: Places where events are held.
+
+paths:
+  /events:
+    get:
+      operationId: listEvents
+      tags: [Events]
+      summary: List events
+      description: |
+        Returns one page of events matching the filters. All filters are optional and combine with AND;
+        no implicit date filter is applied, so clients browsing upcoming events pass `fromDate`.
+
+        Filters: `title`, `fromDate`, `toDate`, `venueId`, `city`, `country`, `genre`. Sort fields:
+        `startsAt`, `title` (whitelist, [API-35]); ties are broken by ascending event `id`.
+
+        Each event's `startsAt` is in the local time of its venue ([API-55]): the offset is the one in
+        force at the venue on that date (e.g. `+02:00` for Turin in summer, `+01:00` in winter), not the
+        caller's. Items of one page can therefore carry different offsets. `fromDate`, `toDate` and the
+        `startsAt` sort compare instants, whatever offset is sent or returned.
+
+        Clients display `startsAt` as returned, in the venue's local time, and convert `salesOpenAt` to
+        their own time zone ([API-56]).
+
+        Public: callable without a token ([ADR-0002](../../adr/0002-public-seat-map.md)).
+      security: []
+      parameters:
+        - name: title
+          in: query
+          required: false
+          description: Return only events whose title contains this text, case-insensitively.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+          example: traviata
+        - name: fromDate
+          in: query
+          required: false
+          description: Return only events starting at or after this instant (inclusive), with explicit offset ([API-05]); compared as an instant, independently of the venues' offsets.
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+          example: '2029-09-01T00:00:00+02:00'
+        - name: toDate
+          in: query
+          required: false
+          description: Return only events starting before this instant (exclusive), with explicit offset ([API-05]); compared as an instant, independently of the venues' offsets. Must not precede `fromDate`.
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+          example: '2029-10-01T00:00:00+02:00'
+        - name: venueId
+          in: query
+          required: false
+          description: Return only events held at this venue.
+          schema:
+            $ref: '#/components/schemas/VenueId'
+          example: 27
+        - name: city
+          in: query
+          required: false
+          description: Return only events whose venue is in this city, compared case-insensitively.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 100
+          example: Torino
+        - name: country
+          in: query
+          required: false
+          description: Return only events whose venue is in this country.
+          schema:
+            $ref: '#/components/schemas/CountryCode'
+          example: IT
+        - name: genre
+          in: query
+          required: false
+          description: Return only events of this genre, compared case-insensitively.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 50
+          example: Opera
+        - name: sort
+          in: query
+          required: false
+          description: Sort field; a leading `-` sorts descending. A cursor is bound to the sort it was issued for.
+          schema:
+            type: string
+            enum: [startsAt, -startsAt, title, -title]
+            default: startsAt
+          example: startsAt
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: One page of events.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlPublic'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPage'
+              example:
+                items:
+                  - id: 413
+                    title: La Traviata
+                    genre: Opera
+                    startsAt: '2029-09-01T21:00:00+02:00'
+                    salesOpenAt: '2029-06-01T10:00:00+02:00'
+                    venue:
+                      id: 27
+                      name: Teatro Regio
+                      city: Torino
+                      country: IT
+                      timeZone: Europe/Rome
+                  - id: 418
+                    title: Tosca
+                    genre: Opera
+                    startsAt: '2029-09-15T20:30:00+02:00'
+                    salesOpenAt: '2029-06-15T10:00:00+02:00'
+                    venue:
+                      id: 27
+                      name: Teatro Regio
+                      city: Torino
+                      country: IT
+                      timeZone: Europe/Rome
+                nextCursor: MjAyOS0wOS0xNXw0MTg
+                limit: 2
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    post:
+      operationId: createEvent
+      tags: [Events]
+      summary: Create an event
+      description: |
+        Organizer operation. Creates an event at an existing venue; the caller becomes the event's
+        owner. `salesOpenAt` must precede `startsAt`.
+
+        **TODO** [ARCH-03]: further event-creation rules (e.g. minimum lead time, limits per organizer)
+        are still to be defined.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        description: The event to create.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventInput'
+            example:
+              title: La Traviata
+              genre: Opera
+              startsAt: '2029-09-01T21:00:00+02:00'
+              salesOpenAt: '2029-06-01T10:00:00+02:00'
+              venueId: 27
+      responses:
+        '201':
+          description: The event is created; the new event is returned.
+          headers:
+            Location:
+              $ref: '#/components/headers/EventLocation'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+              example:
+                id: 413
+                title: La Traviata
+                genre: Opera
+                startsAt: '2029-09-01T21:00:00+02:00'
+                salesOpenAt: '2029-06-01T10:00:00+02:00'
+                venue:
+                  id: 27
+                  name: Teatro Regio
+                  city: Torino
+                  country: IT
+                  timeZone: Europe/Rome
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: A request with the same `Idempotency-Key` is still executing.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                idempotencyKeyInUse:
+                  $ref: '#/components/examples/IdempotencyKeyInUse'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          description: The body is well formed but invalid.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                validationFailed:
+                  $ref: '#/components/examples/EventValidationFailed'
+                venueNotFound:
+                  $ref: '#/components/examples/VenueReferenceNotFound'
+                idempotencyKeyReused:
+                  $ref: '#/components/examples/IdempotencyKeyReused'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /events/{eventId}:
+    get:
+      operationId: getEvent
+      tags: [Events]
+      summary: Get an event
+      description: |
+        Returns the event with a summary of its venue. `If-None-Match` answers `304` when the event is
+        unchanged.
+
+        `startsAt` is in the local time of the venue ([API-55]): the offset is the one in force at the
+        venue on that date, whatever offset the organizer sent, so clients display it as is, labelled
+        with `venue.timeZone`. `salesOpenAt` is an instant that clients convert to their own time zone
+        for display ([API-56]).
+
+        Public: callable without a token ([ADR-0002](../../adr/0002-public-seat-map.md)).
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The event.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlPublic'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+              example:
+                id: 413
+                title: La Traviata
+                genre: Opera
+                startsAt: '2029-09-01T21:00:00+02:00'
+                salesOpenAt: '2029-06-01T10:00:00+02:00'
+                venue:
+                  id: 27
+                  name: Teatro Regio
+                  city: Torino
+                  country: IT
+                  timeZone: Europe/Rome
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/EventNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    put:
+      operationId: replaceEvent
+      tags: [Events]
+      summary: Replace an event
+      description: |
+        Organizer operation, owner only. Replaces the whole event representation ([API-15]): every
+        field is required. Allowed only before the event's sales open (milestone 1 user story);
+        afterwards the request fails with `409 SALES_OPEN`. `salesOpenAt` must precede `startsAt`.
+
+        `If-Match` (optional) carries the event's `ETag`: a stale one answers `412`.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        description: The complete new representation of the event.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventInput'
+            example:
+              title: La Traviata
+              genre: Opera
+              startsAt: '2029-09-01T20:30:00+02:00'
+              salesOpenAt: '2029-06-01T10:00:00+02:00'
+              venueId: 27
+      responses:
+        '200':
+          description: The event after replacement.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+              example:
+                id: 413
+                title: La Traviata
+                genre: Opera
+                startsAt: '2029-09-01T20:30:00+02:00'
+                salesOpenAt: '2029-06-01T10:00:00+02:00'
+                venue:
+                  id: 27
+                  name: Teatro Regio
+                  city: Torino
+                  country: IT
+                  timeZone: Europe/Rome
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/EventForbidden'
+        '404':
+          $ref: '#/components/responses/EventNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          $ref: '#/components/responses/SalesOpen'
+        '412':
+          $ref: '#/components/responses/EventVersionMismatch'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          description: The body is well formed but invalid.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                validationFailed:
+                  $ref: '#/components/examples/EventValidationFailed'
+                venueNotFound:
+                  $ref: '#/components/examples/VenueReferenceNotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    patch:
+      operationId: updateEvent
+      tags: [Events]
+      summary: Update part of an event
+      description: |
+        Organizer operation, owner only. Applies a JSON Merge Patch (RFC 7396, [API-15]): present fields
+        replace the current value, absent fields are kept. Every event field is mandatory, so `null` is
+        rejected with `422`. Allowed only before the event's sales open (milestone 1 user story);
+        afterwards the request fails with `409 SALES_OPEN`. After patching, `salesOpenAt` must still
+        precede `startsAt`.
+
+        `If-Match` (optional) carries the event's `ETag`: a stale one answers `412`.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        description: Merge patch carrying the fields to change.
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/EventPatch'
+            example:
+              startsAt: '2029-09-01T20:30:00+02:00'
+      responses:
+        '200':
+          description: The event after the patch.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+              example:
+                id: 413
+                title: La Traviata
+                genre: Opera
+                startsAt: '2029-09-01T20:30:00+02:00'
+                salesOpenAt: '2029-06-01T10:00:00+02:00'
+                venue:
+                  id: 27
+                  name: Teatro Regio
+                  city: Torino
+                  country: IT
+                  timeZone: Europe/Rome
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/EventForbidden'
+        '404':
+          $ref: '#/components/responses/EventNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          $ref: '#/components/responses/SalesOpen'
+        '412':
+          $ref: '#/components/responses/EventVersionMismatch'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          description: The patch is well formed but invalid.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                validationFailed:
+                  $ref: '#/components/examples/EventValidationFailed'
+                nullField:
+                  summary: A mandatory field is cleared with null
+                  value:
+                    type: /problems/validation-failed
+                    title: Validation failed
+                    status: 422
+                    detail: The request body has invalid fields.
+                    instance: /api/v1/events/413
+                    code: VALIDATION_FAILED
+                    errors:
+                      - field: title
+                        code: REQUIRED
+                        detail: Must not be null.
+                venueNotFound:
+                  $ref: '#/components/examples/VenueReferenceNotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    delete:
+      operationId: deleteEvent
+      tags: [Events]
+      summary: Delete an event
+      description: |
+        Organizer operation, owner only. Deletes an event whose sales have not opened yet; afterwards
+        the request fails with `409 SALES_OPEN`, since seats may already be held or sold ([BIZ-01],
+        [BIZ-02]). Deleting an already deleted event answers `404`: the outcome (no such event) is the
+        same on every repetition ([API-13]).
+
+        `If-Match` (optional) carries the event's `ETag`: a stale one answers `412`.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '204':
+          description: The event is deleted.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/EventForbidden'
+        '404':
+          $ref: '#/components/responses/EventNotFound'
+        '409':
+          $ref: '#/components/responses/SalesOpen'
+        '412':
+          $ref: '#/components/responses/EventVersionMismatch'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /venues:
+    get:
+      operationId: listVenues
+      tags: [Venues]
+      summary: List venues
+      description: |
+        Returns one page of venues matching the filters. All filters are optional and combine with AND.
+        Filters: `city`, `country`. Sort fields: `name` (whitelist, [API-35]); ties are broken by
+        ascending venue `id`.
+
+        Public: callable without a token ([ADR-0002](../../adr/0002-public-seat-map.md)).
+      security: []
+      parameters:
+        - name: city
+          in: query
+          required: false
+          description: Return only venues in this city, compared case-insensitively.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 100
+          example: Torino
+        - name: country
+          in: query
+          required: false
+          description: Return only venues in this country.
+          schema:
+            $ref: '#/components/schemas/CountryCode'
+          example: IT
+        - name: sort
+          in: query
+          required: false
+          description: Sort field; a leading `-` sorts descending. A cursor is bound to the sort it was issued for.
+          schema:
+            type: string
+            enum: [name, -name]
+            default: name
+          example: name
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: One page of venues.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlPublic'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VenuePage'
+              example:
+                items:
+                  - id: 31
+                    name: Auditorium Giovanni Agnelli
+                    city: Torino
+                    country: IT
+                    timeZone: Europe/Rome
+                  - id: 27
+                    name: Teatro Regio
+                    city: Torino
+                    country: IT
+                    timeZone: Europe/Rome
+                nextCursor: null
+                limit: 50
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    post:
+      operationId: createVenue
+      tags: [Venues]
+      summary: Create a venue
+      description: |
+        Organizer operation. Creates a venue that events can then reference by `venueId`.
+
+        **TODO** [ARCH-03]: which role manages venues, and who may update or delete them, is still to be
+        defined; this draft lets organizers create venues only.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        description: The venue to create.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VenueInput'
+            example:
+              name: Teatro Regio
+              city: Torino
+              country: IT
+              timeZone: Europe/Rome
+      responses:
+        '201':
+          description: The venue is created; the new venue is returned.
+          headers:
+            Location:
+              $ref: '#/components/headers/VenueLocation'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Venue'
+              example:
+                id: 27
+                name: Teatro Regio
+                city: Torino
+                country: IT
+                timeZone: Europe/Rome
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: A request with the same `Idempotency-Key` is still executing.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                idempotencyKeyInUse:
+                  $ref: '#/components/examples/IdempotencyKeyInUse'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          description: The body is well formed but invalid.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                validationFailed:
+                  summary: A field is missing or invalid
+                  value:
+                    type: /problems/validation-failed
+                    title: Validation failed
+                    status: 422
+                    detail: The request body has invalid fields.
+                    instance: /api/v1/venues
+                    code: VALIDATION_FAILED
+                    errors:
+                      - field: country
+                        code: INVALID_FORMAT
+                        detail: Must be an ISO 3166-1 alpha-2 code.
+                idempotencyKeyReused:
+                  $ref: '#/components/examples/IdempotencyKeyReused'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /venues/{venueId}:
+    get:
+      operationId: getVenue
+      tags: [Venues]
+      summary: Get a venue
+      description: |
+        Returns the venue. `If-None-Match` answers `304` when the venue is unchanged.
+
+        Public: callable without a token ([ADR-0002](../../adr/0002-public-seat-map.md)).
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The venue.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlPublic'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Venue'
+              example:
+                id: 27
+                name: Teatro Regio
+                city: Torino
+                country: IT
+                timeZone: Europe/Rome
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/VenueNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Keycloak-issued access token, verified by signature on every request ([SEC-02], [SEC-03]).
+        Security requirements list the Keycloak role the operation requires: `customer`, `organizer`
+        or `gate-staff` ([ARCH-30]).
+
+  parameters:
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      description: Identifier of the event.
+      schema:
+        $ref: '#/components/schemas/EventId'
+      example: 413
+    VenueId:
+      name: venueId
+      in: path
+      required: true
+      description: Identifier of the venue.
+      schema:
+        $ref: '#/components/schemas/VenueId'
+      example: 27
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Requested page size; the server clamps it to 200 and echoes the served value in `limit`.
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        default: 50
+      example: 50
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from the `nextCursor` of the previous page; omit it for the first page. Never parse or build it.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+      example: MjAyOS0wOS0xNXw0MTg
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID identifying one logical operation, reused on every retry of it ([API-24]); retained for 24 hours.
+      schema:
+        type: string
+        format: uuid
+      example: 5f0c1c1e-3f4b-4f43-9d7e-2b8a3c7d9e10
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: ETag of the resource as last read; the write fails with 412 if the resource changed since ([API-33]).
+      schema:
+        type: string
+      example: '"v4"'
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: ETag of the representation held by the client; the server answers 304 if it still matches.
+      schema:
+        type: string
+      example: '"v4"'
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Correlation id of the request; generated by the server when absent and returned on the response ([OPS-12]).
+      schema:
+        type: string
+        maxLength: 128
+      example: 0b6f3c4e-8a2d-4c1f-9e7b-5d3a2f1c0e9d
+
+  headers:
+    RequestId:
+      description: Correlation id of the request, reused from the request or generated ([OPS-12]).
+      schema:
+        type: string
+      example: 0b6f3c4e-8a2d-4c1f-9e7b-5d3a2f1c0e9d
+    ETag:
+      description: Strong entity tag carrying the row version of the resource ([API-33]).
+      schema:
+        type: string
+      example: '"v4"'
+    EventLocation:
+      description: URI of the created event ([API-17]).
+      schema:
+        type: string
+        format: uri-reference
+      example: /api/v1/events/413
+    VenueLocation:
+      description: URI of the created venue ([API-17]).
+      schema:
+        type: string
+        format: uri-reference
+      example: /api/v1/venues/27
+    CacheControlPublic:
+      description: Shared caches may store the response for a few minutes ([API-31]).
+      schema:
+        type: string
+      example: public, max-age=300
+    RetryAfter:
+      description: Seconds the client should wait before retrying, with backoff ([API-46]).
+      schema:
+        type: integer
+        minimum: 0
+      example: 5
+
+  schemas:
+    EventId:
+      description: Identifier of an event, assigned by Catalogue and used by every other service to refer to the event.
+      type: integer
+      format: int64
+      minimum: 1
+    VenueId:
+      description: Identifier of a venue, assigned by Catalogue.
+      type: integer
+      format: int64
+      minimum: 1
+
+    Timestamp:
+      description: ISO 8601 timestamp with an explicit UTC offset ([API-05]).
+      type: string
+      format: date-time
+
+    CountryCode:
+      description: ISO 3166-1 alpha-2 country code ([API-54]).
+      type: string
+      pattern: '^[A-Z]{2}$'
+
+    VenueRef:
+      description: Summary of a venue, as embedded in events.
+      type: object
+      required: [id, name, city, country, timeZone]
+      properties:
+        id:
+          $ref: '#/components/schemas/VenueId'
+        name:
+          description: Name of the venue.
+          type: string
+        city:
+          description: City where the venue is.
+          type: string
+        country:
+          $ref: '#/components/schemas/CountryCode'
+        timeZone:
+          $ref: '#/components/schemas/TimeZone'
+
+    TimeZone:
+      description: IANA time zone identifier (e.g. `Europe/Rome`); determines the offset of the venue's event times ([API-55]).
+      type: string
+      minLength: 1
+      maxLength: 64
+
+    Venue:
+      description: A place where events are held.
+      type: object
+      required: [id, name, city, country, timeZone]
+      properties:
+        id:
+          $ref: '#/components/schemas/VenueId'
+        name:
+          description: Name of the venue.
+          type: string
+        city:
+          description: City where the venue is.
+          type: string
+        country:
+          $ref: '#/components/schemas/CountryCode'
+        timeZone:
+          $ref: '#/components/schemas/TimeZone'
+
+    VenueInput:
+      description: Request to create a venue.
+      type: object
+      additionalProperties: false
+      required: [name, city, country, timeZone]
+      properties:
+        name:
+          description: Name of the venue.
+          type: string
+          minLength: 1
+          maxLength: 200
+        city:
+          description: City where the venue is.
+          type: string
+          minLength: 1
+          maxLength: 100
+        country:
+          $ref: '#/components/schemas/CountryCode'
+        timeZone:
+          $ref: '#/components/schemas/TimeZone'
+
+    VenuePage:
+      description: One page of venues.
+      type: object
+      required: [items, nextCursor, limit]
+      properties:
+        items:
+          description: Venues of this page, in the requested sort order.
+          type: array
+          items:
+            $ref: '#/components/schemas/Venue'
+        nextCursor:
+          description: Cursor of the next page; `null` on the last page.
+          type: [string, 'null']
+        limit:
+          description: Page size served after clamping.
+          type: integer
+          format: int32
+
+    Event:
+      description: An event published by an organizer.
+      type: object
+      required: [id, title, genre, startsAt, salesOpenAt, venue]
+      properties:
+        id:
+          $ref: '#/components/schemas/EventId'
+        title:
+          description: Title of the event.
+          type: string
+        genre:
+          description: Genre of the event, e.g. `Opera`, `Rock`.
+          type: string
+        startsAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the event starts, in the local time of the venue ([API-55]); clients display it as is, in venue time ([API-56]).
+        salesOpenAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When ticket sales open; seats can be held from this instant on, and the event can no longer be edited or deleted. Clients display it in their own time zone, whatever offset it carries ([API-56]).
+        venue:
+          $ref: '#/components/schemas/VenueRef'
+
+    EventInput:
+      description: Complete representation of an event, used to create (POST) and replace (PUT) it.
+      type: object
+      additionalProperties: false
+      required: [title, genre, startsAt, salesOpenAt, venueId]
+      properties:
+        title:
+          description: Title of the event.
+          type: string
+          minLength: 1
+          maxLength: 200
+        genre:
+          description: Genre of the event.
+          type: string
+          minLength: 1
+          maxLength: 50
+        startsAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the event starts; later than `salesOpenAt`. Any explicit offset is accepted; responses render it in the venue's local time ([API-55]).
+        salesOpenAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When ticket sales open; earlier than `startsAt`.
+        venueId:
+          $ref: '#/components/schemas/VenueId'
+          description: Existing venue where the event is held.
+
+    EventPatch:
+      description: JSON Merge Patch of an event ([API-15]); absent fields are kept, `null` is rejected because every field is mandatory.
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        title:
+          description: New title of the event.
+          type: string
+          minLength: 1
+          maxLength: 200
+        genre:
+          description: New genre of the event.
+          type: string
+          minLength: 1
+          maxLength: 50
+        startsAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: New start time; must stay later than `salesOpenAt`. Any explicit offset is accepted; responses render it in the venue's local time ([API-55]).
+        salesOpenAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: New sales opening time; must stay earlier than `startsAt`.
+        venueId:
+          $ref: '#/components/schemas/VenueId'
+          description: Existing venue where the event is held.
+
+    EventPage:
+      description: One page of events.
+      type: object
+      required: [items, nextCursor, limit]
+      properties:
+        items:
+          description: Events of this page, in the requested sort order.
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+        nextCursor:
+          description: Cursor of the next page; `null` on the last page.
+          type: [string, 'null']
+        limit:
+          description: Page size served after clamping.
+          type: integer
+          format: int32
+
+    FieldError:
+      description: One invalid field of a request ([STY-20]).
+      type: object
+      required: [field, code, detail]
+      properties:
+        field:
+          description: Path of the invalid field, e.g. `salesOpenAt`.
+          type: string
+        code:
+          description: Stable validation code, e.g. `REQUIRED`, `INVALID_FORMAT`, `OUT_OF_RANGE`.
+          type: string
+        detail:
+          description: Human-readable explanation.
+          type: string
+
+    Problem:
+      description: |
+        RFC 9457 problem document, the single error format of the platform ([API-04]). `code` is a
+        stable machine-readable identifier that never changes once published ([STY-79]).
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type:
+          description: URI reference identifying the problem type.
+          type: string
+          format: uri-reference
+        title:
+          description: Short human-readable summary of the problem type.
+          type: string
+        status:
+          description: HTTP status code of the response.
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          description: Human-readable explanation of this occurrence.
+          type: string
+        instance:
+          description: URI reference of the request that produced the problem.
+          type: string
+          format: uri-reference
+        code:
+          description: Stable error code.
+          type: string
+        errors:
+          description: Field errors; present on validation failures.
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+  examples:
+    EventValidationFailed:
+      summary: A field is missing or invalid
+      value:
+        type: /problems/validation-failed
+        title: Validation failed
+        status: 422
+        detail: The request body has invalid fields.
+        instance: /api/v1/events
+        code: VALIDATION_FAILED
+        errors:
+          - field: salesOpenAt
+            code: OUT_OF_RANGE
+            detail: Must be earlier than startsAt.
+    VenueReferenceNotFound:
+      summary: The referenced venue does not exist
+      value:
+        type: /problems/venue-not-found
+        title: Venue not found
+        status: 422
+        detail: Venue 9999 does not exist.
+        instance: /api/v1/events
+        code: VENUE_NOT_FOUND
+        errors:
+          - field: venueId
+            code: NOT_FOUND
+            detail: No venue with this id.
+    IdempotencyKeyInUse:
+      summary: A request with the same Idempotency-Key is still executing
+      value:
+        type: /problems/idempotency-key-in-use
+        title: Idempotency key in use
+        status: 409
+        detail: A request with this Idempotency-Key is still being processed; retry later.
+        instance: /api/v1/events
+        code: IDEMPOTENCY_KEY_IN_USE
+    IdempotencyKeyReused:
+      summary: The Idempotency-Key was used for a different request
+      value:
+        type: /problems/idempotency-key-reused
+        title: Idempotency key reused
+        status: 422
+        detail: This Idempotency-Key was already used with a different request.
+        instance: /api/v1/events
+        code: IDEMPOTENCY_KEY_REUSED
+
+  responses:
+    NotModified:
+      description: The representation is unchanged since the ETag sent in `If-None-Match`; empty body ([API-32]).
+      headers:
+        ETag:
+          $ref: '#/components/headers/ETag'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+    BadRequest:
+      description: |
+        The request cannot be parsed: malformed JSON, wrong parameter type, timestamp without offset,
+        invalid cursor, unknown sort field, or `toDate` earlier than `fromDate`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/malformed-request
+            title: Malformed request
+            status: 400
+            detail: Query parameter fromDate must be an ISO 8601 timestamp with an explicit offset.
+            instance: /api/v1/events
+            code: MALFORMED_REQUEST
+    Unauthorized:
+      description: The bearer token is missing or invalid ([SEC-06]).
+      headers:
+        WWW-Authenticate:
+          description: Authentication challenge for the bearer scheme.
+          schema:
+            type: string
+          example: Bearer
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/unauthenticated
+            title: Unauthenticated
+            status: 401
+            detail: A valid bearer token is required.
+            instance: /api/v1/events
+            code: UNAUTHENTICATED
+    Forbidden:
+      description: The caller is authenticated but lacks the role the operation requires ([SEC-06]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/forbidden
+            title: Forbidden
+            status: 403
+            detail: This operation requires the organizer role.
+            instance: /api/v1/events
+            code: FORBIDDEN
+    EventForbidden:
+      description: The caller lacks the organizer role, or the event belongs to another organizer ([SEC-06]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            forbidden:
+              summary: The caller is not an organizer
+              value:
+                type: /problems/forbidden
+                title: Forbidden
+                status: 403
+                detail: This operation requires the organizer role.
+                instance: /api/v1/events/413
+                code: FORBIDDEN
+            eventNotOwned:
+              summary: The event belongs to another organizer
+              value:
+                type: /problems/event-not-owned
+                title: Event not owned
+                status: 403
+                detail: Event 413 belongs to another organizer.
+                instance: /api/v1/events/413
+                code: EVENT_NOT_OWNED
+    EventNotFound:
+      description: The event does not exist.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/event-not-found
+            title: Event not found
+            status: 404
+            detail: Event 413 does not exist.
+            instance: /api/v1/events/413
+            code: EVENT_NOT_FOUND
+    VenueNotFound:
+      description: The venue does not exist.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/venue-not-found
+            title: Venue not found
+            status: 404
+            detail: Venue 27 does not exist.
+            instance: /api/v1/venues/27
+            code: VENUE_NOT_FOUND
+    SalesOpen:
+      description: The event's sales have opened; it can no longer be modified or deleted.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/sales-open
+            title: Sales open
+            status: 409
+            detail: Sales for event 413 opened at 2029-06-01T10:00:00+02:00; the event can no longer be changed.
+            instance: /api/v1/events/413
+            code: SALES_OPEN
+    EventVersionMismatch:
+      description: The event changed since the ETag sent in `If-Match` was read ([API-33]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/event-version-mismatch
+            title: Event changed
+            status: 412
+            detail: Event 413 changed since it was read; re-read it and reapply the change.
+            instance: /api/v1/events/413
+            code: EVENT_VERSION_MISMATCH
+    NotAcceptable:
+      description: The `Accept` header allows no media type this operation produces ([API-43]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/not-acceptable
+            title: Not acceptable
+            status: 406
+            detail: This operation produces application/json.
+            instance: /api/v1/events
+            code: NOT_ACCEPTABLE
+    UnsupportedMediaType:
+      description: The `Content-Type` of the body is not accepted by this operation ([API-43]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/unsupported-media-type
+            title: Unsupported media type
+            status: 415
+            detail: This operation consumes application/json.
+            instance: /api/v1/events
+            code: UNSUPPORTED_MEDIA_TYPE
+    TooManyRequests:
+      description: The caller exceeded its rate limit (per user, or per client on public reads); retry after `Retry-After` seconds ([API-18], [API-46]).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/rate-limited
+            title: Too many requests
+            status: 429
+            detail: Rate limit exceeded; retry later.
+            instance: /api/v1/events
+            code: RATE_LIMITED
+    InternalServerError:
+      description: Unexpected server failure; details are logged with the correlation id, not returned ([OPS-17]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/internal-error
+            title: Internal server error
+            status: 500
+            detail: An unexpected error occurred.
+            instance: /api/v1/events
+            code: INTERNAL_ERROR
+    ServiceUnavailable:
+      description: The service is shedding load or its database is unavailable; retry after `Retry-After` seconds ([API-19], [OPS-02]).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/service-unavailable
+            title: Service unavailable
+            status: 503
+            detail: The service is overloaded; retry later.
+            instance: /api/v1/events
+            code: SERVICE_UNAVAILABLE
