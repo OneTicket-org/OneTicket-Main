@@ -4,7 +4,7 @@
 | --------------------------------------- | ------------------ |
 | venues, events                          | Catalogue          |
 | seats, holds, orders                    | Inventory & Orders |
-| Pagamenti, rimborsi, registro contabile | Payments           |
+| payments, refunds                       | Payments           |
 | ticket scan tracking data               | Ticketing          |
 | email tracking data                     | Notifications      |
 
