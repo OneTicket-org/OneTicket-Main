@@ -11,15 +11,15 @@
 
 ### Actors
 
-* Organisers: who publish new events on the ticketing platform, with ticket details, maps and availability;
+* Organizers: who publish new events on the ticketing platform, with ticket details, maps and availability;
 * Customers: who want to buy a ticket for an event from the ticketing platform;
 * Gate Staff: who need to physically scan event customers' tickets at the start of an event;
 
 ### Main User Stories
 
-* As an organiser, I want to create a new event on the ticketing platform, defining all the necessary details before the sales starts
-* As an organiser, I want to be able to edit the details of an event I own before the start of the sales
-* As an organiser, I want to follow my own events' sales through a dashboard
+* As an organizer, I want to create a new event on the ticketing platform, defining all the necessary details before the sales starts
+* As an organizer, I want to be able to edit the details of an event I own before the start of the sales
+* As an organizer, I want to follow my own events' sales through a dashboard
 * As a customer, I want to browse available tickets for an event
 * As a customer, I want to hold seat(s) until I complete the payment of the respective ticket(s)
 * As a customer, I want to buy ticket(s) for an event

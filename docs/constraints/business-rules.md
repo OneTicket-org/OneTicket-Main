@@ -30,6 +30,7 @@ stateDiagram-v2
 - **DOMAIN** [BIZ-07] SOLD → FREE (refund) must also reverse the payment: a compensation, i.e. a new action reversing the business effect without deleting history, not an undo
 - **DOMAIN** [BIZ-08] A customer may hold only a bounded number of seats (limit set in configuration), failing with `HoldLimitReached`
 - **TODO** [BIZ-09] Define a race-safe mechanism enforcing the per-customer hold limit (counting active holds before inserting is check-then-act)
+- **TODO** [BIZ-27] Define the hold extension policy: whether and how often a customer may extend an active hold, by how much, and the maximum total hold lifetime
 - **TODO** [BIZ-10] Define what happens when a hold expires while its payment is still in progress at the PSP
 
 ### Order lifecycle
@@ -39,6 +40,7 @@ stateDiagram-v2
 - **DOMAIN** [BIZ-13] Cancellation: `PENDING` -> `CANCELLED`, covering every unsuccessful outcome (payment declined or timed out, hold expired or released); the order's held seats are released by the service
 - **DOMAIN** [BIZ-14] Refund: `PAID` -> `REFUNDED`, customer asks for a refund
 - **DOMAIN** [BIZ-15] Illegal transitions are refused: e.g. CANCELLED → PAID never
+- **TODO** [BIZ-28] Define what happens when a customer cancels a `PENDING` order while its payment is still in progress at the PSP
 
 ### Payments
 

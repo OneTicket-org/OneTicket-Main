@@ -15,6 +15,7 @@
 - [docs/milestones/milestone2/purchase_flow.md](docs/milestones/milestone2/purchase_flow.md) — Milestone 2: ticket purchase flow (sequence diagram).
 - [docs/adr/](docs/adr/) — architecture decision records.
   - [0001-seat-inventory-placement.md](docs/adr/0001-seat-inventory-placement.md) — seats, holds and orders in Inventory & Orders; Catalogue keeps events and venues.
+  - [0002-public-seat-map.md](docs/adr/0002-public-seat-map.md) — seat maps readable without authentication (deviation from [SEC-02]).
 
 ## Rules for agents
 

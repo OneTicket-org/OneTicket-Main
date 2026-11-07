@@ -1,0 +1,1715 @@
+openapi: 3.1.0
+info:
+  title: OneTicket Inventory & Orders API
+  version: 0.1.0-draft
+  summary: Seat inventory, seat holds and orders of the OneTicket platform.
+  description: |
+    Draft contract of the Inventory & Orders service (Rust/Axum). The service owns the sellable
+    seat inventory of each event, seat holds and orders; Catalogue owns event and venue data
+    ([ADR-0001](../../adr/0001-seat-inventory-placement.md)).
+
+    ## Conventions
+
+    - **Base path**: every operation is mounted once under `/api/v1` ([API-10]); the API version is
+      carried by the URI.
+    - **Authentication**: Keycloak-issued bearer JWT ([SEC-03], [SEC-05]). Keycloak roles are
+      `customer`, `organizer` and `gate-staff` ([ARCH-30]); the global requirement is the `customer`
+      role, overridden per operation. Seat reads are public: no token required ([ADR-0002](../../adr/0002-public-seat-map.md)).
+    - **Errors**: `application/problem+json` (RFC 9457) carrying a stable `code` ([API-04], [STY-79]);
+      `422` bodies list field errors as `{field, code, detail}` ([STY-20]).
+    - **Idempotency**: every `POST` requires an `Idempotency-Key` (a UUID generated once per logical
+      operation and reused on each retry of it) ([API-23], [API-24]). A finished key replays the stored
+      status and body without re-executing; a key still executing answers `409 IDEMPOTENCY_KEY_IN_USE`;
+      a key reused with a different method, URI or body answers `422 IDEMPOTENCY_KEY_REUSED`
+      ([API-25], [API-26]). Keys are retained for 24 hours (set in configuration [OPS-26]): a retry
+      is safe within that window ([API-27]).
+    - **Pagination**: cursor (keyset) pagination with the envelope `{items, nextCursor, limit}`
+      ([API-35], [API-38]). `limit` defaults to 50 and is clamped to 200 (set in configuration
+      [OPS-26]); the served value is echoed in `limit` ([API-37]). The cursor is opaque
+      ([API-36]) and `nextCursor` is `null` on the last page. Collections report no total count
+      ([API-39]).
+    - **Concurrency**: seats, holds and orders carry a row version exposed as a strong `ETag`.
+      Writes accept `If-Match` and answer `412` when it is stale ([API-29], [API-33]); reads accept
+      `If-None-Match` and answer `304` when unchanged ([API-32], [API-34]).
+    - **Caching**: holds and orders are `Cache-Control: no-store` ([API-30]); seat data is never
+      served from a cache without revalidation ([API-31]).
+    - **Strictness**: request bodies reject unknown fields and implicit type coercion ([API-51],
+      [API-52]); timestamps are ISO 8601 with an explicit UTC offset, timestamps without offset are
+      rejected ([API-05]); money is an object with a string amount and an ISO 4217 currency ([BIZ-24]).
+    - **Correlation**: `X-Request-Id` is reused from the request or generated, and returned on every
+      response ([OPS-12]).
+    - **Overload**: `429` and `503` carry `Retry-After` ([API-19], [API-46]).
+
+    ## Not covered by this draft
+
+    Seat stream (SSE, [ARCH-13]; authentication and resumption are open, [ARCH-14], [ARCH-15]),
+    refunds (owned by Payments, `PAID -> REFUNDED` is applied from an asynchronous message, [BIZ-14]),
+    seat inventory set-up from Catalogue (mechanism open, ADR-0001), health endpoints (outside
+    `/api/v1`, [API-10]).
+
+servers:
+  - url: /api/v1
+    description: Version 1 of the API, mounted once ([API-10]).
+
+security:
+  - bearerAuth: [customer]
+
+tags:
+  - name: Seats
+    description: Sellable seat inventory of an event and live seat state (FREE, HELD, SOLD; [BIZ-03]).
+  - name: Holds
+    description: Temporary reservations of one seat by one customer, with a time to live ([BIZ-04], [BIZ-06]).
+  - name: Orders
+    description: Purchases of one or more held seats, associated with a payment ([BIZ-11]).
+
+paths:
+  /events/{eventId}/seats:
+    get:
+      operationId: listEventSeats
+      tags: [Seats]
+      summary: List the seats of an event
+      description: |
+        Returns one page of the event's seats with their current state and price. Seats are ordered by
+        ascending seat `id`; no other sort order and no filters are offered.
+
+        The seat map is not cacheable ([API-31]): the response is `no-store`. Each item carries the
+        seat's `etag`, to be sent as `If-Match` when placing a hold on that seat.
+
+        Public: callable without a token ([ADR-0002](../../adr/0002-public-seat-map.md)).
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: One page of seats.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatPage'
+              example:
+                items:
+                  - id: 9001
+                    eventId: 413
+                    label: A13
+                    sector: Stalls
+                    state: FREE
+                    price:
+                      amount: '45.10'
+                      currency: EUR
+                    etag: '"v3"'
+                  - id: 9002
+                    eventId: 413
+                    label: A14
+                    sector: Stalls
+                    state: HELD
+                    price:
+                      amount: '45.10'
+                      currency: EUR
+                    etag: '"v7"'
+                nextCursor: OTAwMnw5MDAy
+                limit: 2
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/EventNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /events/{eventId}/seats/{seatId}:
+    get:
+      operationId: getEventSeat
+      tags: [Seats]
+      summary: Get one seat of an event
+      description: |
+        Returns the seat with its current state and price. The `ETag` is the seat's row version, to be
+        sent as `If-Match` when placing a hold ([API-29]). The representation must be revalidated on
+        every use (`no-cache`, [API-31]); `If-None-Match` answers `304` when the seat is unchanged.
+
+        Public: callable without a token ([ADR-0002](../../adr/0002-public-seat-map.md)).
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/SeatId'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The seat.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoCache'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Seat'
+              example:
+                id: 9001
+                eventId: 413
+                label: A13
+                sector: Stalls
+                state: FREE
+                price:
+                  amount: '45.10'
+                  currency: EUR
+                etag: '"v3"'
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/SeatNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /events/{eventId}/holds:
+    post:
+      operationId: placeHold
+      tags: [Holds]
+      summary: Hold a seat
+      description: |
+        Customer operation. Moves one FREE seat of the event to HELD for the calling customer and
+        creates a hold that expires at `expiresAt` (time to live set in configuration, about ten
+        minutes, [OPS-26]). Several seats are held with one hold each.
+
+        - Of several concurrent requests for the same seat, at most one succeeds ([BIZ-04]); the others
+          fail fast with `409 SEAT_UNAVAILABLE` and should refresh the seat map ([API-20], [API-21]).
+        - `If-Match` (optional) carries the seat's `ETag` as read from the seat map: if the seat changed
+          since, the request fails with `412 SEAT_VERSION_MISMATCH` ([API-29]).
+        - A customer holds at most a configured number of active seats ([BIZ-08]); beyond it the request
+          fails with `409 HOLD_LIMIT_REACHED`.
+        - Holds are only granted while the event's sales are open (`409 SALES_CLOSED`).
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: If-Match
+          in: header
+          required: false
+          description: ETag of the seat named in the body, as returned by the seat map or `getEventSeat`.
+          schema:
+            type: string
+          example: '"v3"'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        description: The seat to hold.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HoldCreate'
+            example:
+              seatId: 9001
+      responses:
+        '201':
+          description: The seat is HELD; the new hold is returned.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+              example:
+                id: 98213
+                eventId: 413
+                seat:
+                  id: 9001
+                  label: A13
+                  sector: Stalls
+                status: ACTIVE
+                createdAt: '2029-09-01T20:50:00+02:00'
+                expiresAt: '2029-09-01T21:00:00+02:00'
+                orderId: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/EventNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: The seat cannot be held in the current state.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                seatUnavailable:
+                  $ref: '#/components/examples/SeatUnavailable'
+                holdLimitReached:
+                  $ref: '#/components/examples/HoldLimitReached'
+                salesClosed:
+                  $ref: '#/components/examples/SalesClosed'
+                idempotencyKeyInUse:
+                  $ref: '#/components/examples/IdempotencyKeyInUse'
+        '412':
+          description: The seat changed since the ETag sent in `If-Match` was read.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: /problems/seat-version-mismatch
+                title: Seat changed
+                status: 412
+                detail: Seat 9001 changed since it was read; refresh the seat map and retry.
+                instance: /api/v1/events/413/holds
+                code: SEAT_VERSION_MISMATCH
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          description: The body is well formed but invalid.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                validationFailed:
+                  $ref: '#/components/examples/ValidationFailed'
+                seatNotFound:
+                  summary: The seat does not belong to the event
+                  value:
+                    type: /problems/seat-not-found
+                    title: Seat not found
+                    status: 422
+                    detail: Event 413 has no seat 9999.
+                    instance: /api/v1/events/413/holds
+                    code: SEAT_NOT_FOUND
+                idempotencyKeyReused:
+                  $ref: '#/components/examples/IdempotencyKeyReused'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /holds/{holdId}:
+    get:
+      operationId: getHold
+      tags: [Holds]
+      summary: Get a hold
+      description: |
+        Customer operation. Returns one of the caller's holds. Another customer's hold answers `404`
+        ([API-18]). `If-None-Match` answers `304` when the hold is unchanged.
+      parameters:
+        - $ref: '#/components/parameters/HoldId'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The hold.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+              example:
+                id: 98213
+                eventId: 413
+                seat:
+                  id: 9001
+                  label: A13
+                  sector: Stalls
+                status: ACTIVE
+                createdAt: '2029-09-01T20:50:00+02:00'
+                expiresAt: '2029-09-01T21:00:00+02:00'
+                orderId: 5512
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/HoldNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    patch:
+      operationId: extendHold
+      tags: [Holds]
+      summary: Extend a hold's expiry
+      description: |
+        Customer operation. Moves the expiry of an ACTIVE hold later, with a JSON Merge Patch
+        (RFC 7396, [API-15]); `expiresAt` is the only patchable field. Setting the same `expiresAt`
+        again returns the same result.
+
+        The new `expiresAt` must be later than the current one; a request outside the extension policy
+        answers `422 HOLD_EXTENSION_NOT_ALLOWED`.
+
+        **TODO** [BIZ-27]: the hold extension policy (maximum hold lifetime, number and length of
+        extensions) is still to be defined.
+
+        `If-Match` (optional) carries the hold's `ETag`: a stale one answers `412`.
+      parameters:
+        - $ref: '#/components/parameters/HoldId'
+        - name: If-Match
+          in: header
+          required: false
+          description: ETag of the hold as last read; the update fails with 412 if the hold changed since.
+          schema:
+            type: string
+          example: '"v1"'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        description: Merge patch carrying the requested expiry.
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/HoldPatch'
+            example:
+              expiresAt: '2029-09-01T21:05:00+02:00'
+      responses:
+        '200':
+          description: The hold with its new expiry.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Hold'
+              example:
+                id: 98213
+                eventId: 413
+                seat:
+                  id: 9001
+                  label: A13
+                  sector: Stalls
+                status: ACTIVE
+                createdAt: '2029-09-01T20:50:00+02:00'
+                expiresAt: '2029-09-01T21:05:00+02:00'
+                orderId: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/HoldNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: The hold is no longer ACTIVE.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: /problems/hold-not-active
+                title: Hold not active
+                status: 409
+                detail: Hold 98213 is EXPIRED.
+                instance: /api/v1/holds/98213
+                code: HOLD_NOT_ACTIVE
+        '412':
+          description: The hold changed since the ETag sent in `If-Match` was read.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: /problems/hold-version-mismatch
+                title: Hold changed
+                status: 412
+                detail: Hold 98213 changed since it was read; re-read it and retry.
+                instance: /api/v1/holds/98213
+                code: HOLD_VERSION_MISMATCH
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          description: The patch is well formed but invalid.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                validationFailed:
+                  $ref: '#/components/examples/ValidationFailed'
+                extensionNotAllowed:
+                  summary: The requested expiry is outside the extension policy
+                  value:
+                    type: /problems/hold-extension-not-allowed
+                    title: Hold extension not allowed
+                    status: 422
+                    detail: The requested expiry is outside the hold extension policy.
+                    instance: /api/v1/holds/98213
+                    code: HOLD_EXTENSION_NOT_ALLOWED
+                    errors:
+                      - field: expiresAt
+                        code: OUT_OF_RANGE
+                        detail: Outside the hold extension policy.
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    delete:
+      operationId: releaseHold
+      tags: [Holds]
+      summary: Release a hold
+      description: |
+        Customer operation. Releases the hold and frees its seat (HELD -> FREE, [BIZ-03]). Idempotent:
+        releasing a hold that is already RELEASED or EXPIRED answers `204` again ([API-14]).
+
+        Releasing a hold that belongs to a PENDING order cancels that order and releases its other
+        holds ([BIZ-13], cancellation reason `HOLD_RELEASED`). A CONFIRMED hold (seat SOLD) cannot be
+        released: `409 HOLD_CONFIRMED`; refunds go through Payments ([BIZ-07], [BIZ-14]).
+      parameters:
+        - $ref: '#/components/parameters/HoldId'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '204':
+          description: The hold is released (or was already released or expired).
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/HoldNotFound'
+        '409':
+          description: The hold is CONFIRMED and its seat is SOLD.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: /problems/hold-confirmed
+                title: Hold confirmed
+                status: 409
+                detail: Hold 98213 belongs to paid order 5512; request a refund instead.
+                instance: /api/v1/holds/98213
+                code: HOLD_CONFIRMED
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /orders:
+    post:
+      operationId: createOrder
+      tags: [Orders]
+      summary: Create an order from held seats
+      description: |
+        Customer operation. Creates a PENDING order ([BIZ-11]) for one or more of the caller's ACTIVE
+        holds of the same event, then requests the payment from Payments; the order carries the
+        resulting `paymentId`, which the client uses to pay at the PSP. The outcome of the payment is
+        observed on the order resource (`Location`): `PAID` on success ([BIZ-12]), `CANCELLED` on every
+        unsuccessful outcome ([BIZ-13]).
+
+        `Idempotency-Key` guarantees that a retried purchase never creates a second order nor a second
+        payment ([BIZ-17]). Each order line stores the seat price at creation time.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        description: The holds to purchase.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreate'
+            example:
+              holdIds: [98213, 98214]
+      responses:
+        '201':
+          description: The order is PENDING, awaiting payment.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              example:
+                id: 5512
+                eventId: 413
+                status: PENDING
+                lines:
+                  - holdId: 98213
+                    seat:
+                      id: 9001
+                      label: A13
+                      sector: Stalls
+                    price:
+                      amount: '45.10'
+                      currency: EUR
+                  - holdId: 98214
+                    seat:
+                      id: 9002
+                      label: A14
+                      sector: Stalls
+                    price:
+                      amount: '45.10'
+                      currency: EUR
+                total:
+                  amount: '90.20'
+                  currency: EUR
+                paymentId: pay_01J8Z3Q4M2
+                createdAt: '2029-09-01T20:52:00+02:00'
+                paidAt: null
+                cancelledAt: null
+                cancellationReason: null
+                refundedAt: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: A hold cannot be ordered in its current state.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                holdNotActive:
+                  summary: A hold expired or was released
+                  value:
+                    type: /problems/hold-not-active
+                    title: Hold not active
+                    status: 409
+                    detail: Hold 98214 is EXPIRED.
+                    instance: /api/v1/orders
+                    code: HOLD_NOT_ACTIVE
+                holdAlreadyOrdered:
+                  summary: A hold already belongs to another order
+                  value:
+                    type: /problems/hold-already-ordered
+                    title: Hold already ordered
+                    status: 409
+                    detail: Hold 98213 already belongs to order 5511.
+                    instance: /api/v1/orders
+                    code: HOLD_ALREADY_ORDERED
+                idempotencyKeyInUse:
+                  $ref: '#/components/examples/IdempotencyKeyInUse'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          description: The body is well formed but invalid.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                validationFailed:
+                  $ref: '#/components/examples/ValidationFailed'
+                holdNotFound:
+                  summary: A hold does not exist or belongs to another customer
+                  value:
+                    type: /problems/hold-not-found
+                    title: Hold not found
+                    status: 422
+                    detail: Hold 98299 does not exist.
+                    instance: /api/v1/orders
+                    code: HOLD_NOT_FOUND
+                holdsSpanEvents:
+                  summary: The holds belong to different events
+                  value:
+                    type: /problems/holds-span-events
+                    title: Holds span several events
+                    status: 422
+                    detail: All holds of an order must belong to the same event.
+                    instance: /api/v1/orders
+                    code: HOLDS_SPAN_EVENTS
+                idempotencyKeyReused:
+                  $ref: '#/components/examples/IdempotencyKeyReused'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    get:
+      operationId: listOrders
+      tags: [Orders]
+      summary: List the caller's orders
+      description: |
+        Customer operation. Returns one page of the caller's orders, newest first by default.
+        Filters: `status`, `eventId`. Sort fields: `createdAt` (whitelist).
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Return only orders in this status.
+          schema:
+            $ref: '#/components/schemas/OrderStatus'
+          example: PAID
+        - name: eventId
+          in: query
+          required: false
+          description: Return only orders for this event.
+          schema:
+            $ref: '#/components/schemas/EventId'
+          example: 413
+        - name: sort
+          in: query
+          required: false
+          description: Sort field; a leading `-` sorts descending. A cursor is bound to the sort it was issued for.
+          schema:
+            type: string
+            enum: [createdAt, -createdAt]
+            default: -createdAt
+          example: -createdAt
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: One page of orders.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderPage'
+              example:
+                items:
+                  - id: 5512
+                    eventId: 413
+                    status: PAID
+                    lines:
+                      - holdId: 98213
+                        seat:
+                          id: 9001
+                          label: A13
+                          sector: Stalls
+                        price:
+                          amount: '45.10'
+                          currency: EUR
+                    total:
+                      amount: '45.10'
+                      currency: EUR
+                    paymentId: pay_01J8Z3Q4M2
+                    createdAt: '2029-09-01T20:52:00+02:00'
+                    paidAt: '2029-09-01T20:54:10+02:00'
+                    cancelledAt: null
+                    cancellationReason: null
+                    refundedAt: null
+                nextCursor: null
+                limit: 50
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /orders/{orderId}:
+    get:
+      operationId: getOrder
+      tags: [Orders]
+      summary: Get an order
+      description: |
+        Customer operation. Returns one of the caller's orders; this is where the outcome of the
+        payment is observed. Another customer's order answers `404` ([API-18]). `If-None-Match`
+        answers `304` when the order is unchanged.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The order.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              example:
+                id: 5512
+                eventId: 413
+                status: PAID
+                lines:
+                  - holdId: 98213
+                    seat:
+                      id: 9001
+                      label: A13
+                      sector: Stalls
+                    price:
+                      amount: '45.10'
+                      currency: EUR
+                total:
+                  amount: '45.10'
+                  currency: EUR
+                paymentId: pay_01J8Z3Q4M2
+                createdAt: '2029-09-01T20:52:00+02:00'
+                paidAt: '2029-09-01T20:54:10+02:00'
+                cancelledAt: null
+                cancellationReason: null
+                refundedAt: null
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /orders/{orderId}/cancellation:
+    post:
+      operationId: cancelOrder
+      tags: [Orders]
+      summary: Cancel a pending order
+      description: |
+        Customer operation. Cancels a PENDING order (PENDING -> CANCELLED, reason `CUSTOMER_REQUEST`,
+        [BIZ-13]) and releases its holds, freeing their seats. The cancellation is inspectable on the
+        order (`status`, `cancelledAt`, `cancellationReason`). Cancelling an already CANCELLED order
+        returns it unchanged. A PAID or REFUNDED order cannot be cancelled (`409 ORDER_NOT_CANCELLABLE`,
+        [BIZ-15]); refunds go through Payments ([BIZ-14]).
+
+        **Open point** [BIZ-28]: the outcome of a cancellation while the order's payment is still in
+        progress at the PSP is not defined yet.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: If-Match
+          in: header
+          required: false
+          description: ETag of the order as last read; the cancellation fails with 412 if the order changed since.
+          schema:
+            type: string
+          example: '"v1"'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The order is CANCELLED.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              example:
+                id: 5512
+                eventId: 413
+                status: CANCELLED
+                lines:
+                  - holdId: 98213
+                    seat:
+                      id: 9001
+                      label: A13
+                      sector: Stalls
+                    price:
+                      amount: '45.10'
+                      currency: EUR
+                total:
+                  amount: '45.10'
+                  currency: EUR
+                paymentId: pay_01J8Z3Q4M2
+                createdAt: '2029-09-01T20:52:00+02:00'
+                paidAt: null
+                cancelledAt: '2029-09-01T20:53:30+02:00'
+                cancellationReason: CUSTOMER_REQUEST
+                refundedAt: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: The order cannot be cancelled in its current state.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                orderNotCancellable:
+                  summary: The order is already PAID or REFUNDED
+                  value:
+                    type: /problems/order-not-cancellable
+                    title: Order not cancellable
+                    status: 409
+                    detail: Order 5512 is PAID; request a refund instead.
+                    instance: /api/v1/orders/5512/cancellation
+                    code: ORDER_NOT_CANCELLABLE
+                idempotencyKeyInUse:
+                  $ref: '#/components/examples/IdempotencyKeyInUse'
+        '412':
+          description: The order changed since the ETag sent in `If-Match` was read.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: /problems/order-version-mismatch
+                title: Order changed
+                status: 412
+                detail: Order 5512 changed since it was read; re-read it and retry.
+                instance: /api/v1/orders/5512/cancellation
+                code: ORDER_VERSION_MISMATCH
+        '422':
+          description: The idempotency key was already used for a different request.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                idempotencyKeyReused:
+                  $ref: '#/components/examples/IdempotencyKeyReused'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Keycloak-issued access token, verified by signature on every request ([SEC-02], [SEC-03]).
+        Security requirements list the Keycloak role the operation requires: `customer`, `organizer`
+        or `gate-staff` ([ARCH-30]).
+
+  parameters:
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      description: Identifier of the event, as assigned by Catalogue.
+      schema:
+        $ref: '#/components/schemas/EventId'
+      example: 413
+    SeatId:
+      name: seatId
+      in: path
+      required: true
+      description: Identifier of the seat within the event's inventory.
+      schema:
+        $ref: '#/components/schemas/SeatId'
+      example: 9001
+    HoldId:
+      name: holdId
+      in: path
+      required: true
+      description: Identifier of the hold.
+      schema:
+        $ref: '#/components/schemas/HoldId'
+      example: 98213
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      description: Identifier of the order.
+      schema:
+        $ref: '#/components/schemas/OrderId'
+      example: 5512
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Requested page size; the server clamps it to 200 and echoes the served value in `limit`.
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        default: 50
+      example: 50
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from the `nextCursor` of the previous page; omit it for the first page. Never parse or build it.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+      example: OTAwMnw5MDAy
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID identifying one logical operation, reused on every retry of it ([API-24]); retained for 24 hours.
+      schema:
+        type: string
+        format: uuid
+      example: 5f0c1c1e-3f4b-4f43-9d7e-2b8a3c7d9e10
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: ETag of the representation held by the client; the server answers 304 if it still matches.
+      schema:
+        type: string
+      example: '"v3"'
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Correlation id of the request; generated by the server when absent and returned on the response ([OPS-12]).
+      schema:
+        type: string
+        maxLength: 128
+      example: 0b6f3c4e-8a2d-4c1f-9e7b-5d3a2f1c0e9d
+
+  headers:
+    RequestId:
+      description: Correlation id of the request, reused from the request or generated ([OPS-12]).
+      schema:
+        type: string
+      example: 0b6f3c4e-8a2d-4c1f-9e7b-5d3a2f1c0e9d
+    ETag:
+      description: Strong entity tag carrying the row version of the resource ([API-29]).
+      schema:
+        type: string
+      example: '"v3"'
+    Location:
+      description: URI of the created resource ([API-17]).
+      schema:
+        type: string
+        format: uri-reference
+      example: /api/v1/holds/98213
+    CacheControlNoStore:
+      description: The response must not be stored by any cache ([API-30], [API-31]).
+      schema:
+        type: string
+        const: no-store
+      example: no-store
+    CacheControlNoCache:
+      description: The response must be revalidated before each reuse ([API-31]).
+      schema:
+        type: string
+        const: no-cache
+      example: no-cache
+    RetryAfter:
+      description: Seconds the client should wait before retrying, with backoff ([API-46]).
+      schema:
+        type: integer
+        minimum: 0
+      example: 5
+
+  schemas:
+    EventId:
+      description: Identifier of an event, assigned by Catalogue.
+      type: integer
+      format: int64
+      minimum: 1
+    SeatId:
+      description: Identifier of a seat in the inventory of an event.
+      type: integer
+      format: int64
+      minimum: 1
+    HoldId:
+      description: Identifier of a hold.
+      type: integer
+      format: int64
+      minimum: 1
+    OrderId:
+      description: Identifier of an order.
+      type: integer
+      format: int64
+      minimum: 1
+
+    Timestamp:
+      description: ISO 8601 timestamp with an explicit UTC offset ([API-05]).
+      type: string
+      format: date-time
+
+    Money:
+      description: Exact amount of money with its ISO 4217 currency ([BIZ-24]).
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          description: Decimal amount as a string with two fraction digits, fitting NUMERIC(12,2) ([BIZ-23]).
+          type: string
+          pattern: '^-?[0-9]{1,10}\.[0-9]{2}$'
+        currency:
+          description: ISO 4217 alphabetic currency code.
+          type: string
+          pattern: '^[A-Z]{3}$'
+
+    SeatState:
+      description: State of a seat ([BIZ-03]). FREE is available; HELD is reserved by an active hold; SOLD is paid.
+      type: string
+      enum: [FREE, HELD, SOLD]
+
+    SeatRef:
+      description: Identification of a seat, as embedded in holds and order lines.
+      type: object
+      required: [id, label, sector]
+      properties:
+        id:
+          $ref: '#/components/schemas/SeatId'
+        label:
+          description: Human-readable seat label printed on the ticket, carrying row and seat number (e.g. `A13`).
+          type: string
+        sector:
+          description: Venue sector of the seat.
+          type: string
+
+    Seat:
+      description: A seat of an event's inventory with its live state and price.
+      type: object
+      required: [id, eventId, label, sector, state, price, etag]
+      properties:
+        id:
+          $ref: '#/components/schemas/SeatId'
+        eventId:
+          $ref: '#/components/schemas/EventId'
+        label:
+          description: Human-readable seat label printed on the ticket, carrying row and seat number (e.g. `A13`).
+          type: string
+        sector:
+          description: Venue sector of the seat.
+          type: string
+        state:
+          $ref: '#/components/schemas/SeatState'
+        price:
+          $ref: '#/components/schemas/Money'
+        etag:
+          description: The seat's current ETag, identical to the `ETag` header of `getEventSeat`; send it as `If-Match` when placing a hold.
+          type: string
+
+    SeatPage:
+      description: One page of seats.
+      type: object
+      required: [items, nextCursor, limit]
+      properties:
+        items:
+          description: Seats of this page, by ascending seat id.
+          type: array
+          items:
+            $ref: '#/components/schemas/Seat'
+        nextCursor:
+          description: Cursor of the next page; `null` on the last page.
+          type: [string, 'null']
+        limit:
+          description: Page size served after clamping.
+          type: integer
+          format: int32
+
+    HoldStatus:
+      description: |
+        State of a hold. ACTIVE reserves the seat until `expiresAt`; EXPIRED and RELEASED have freed it
+        ([BIZ-06]); CONFIRMED means its order was paid and the seat is SOLD.
+      type: string
+      enum: [ACTIVE, EXPIRED, RELEASED, CONFIRMED]
+
+    HoldCreate:
+      description: Request to hold one seat of the event in the path.
+      type: object
+      additionalProperties: false
+      required: [seatId]
+      properties:
+        seatId:
+          $ref: '#/components/schemas/SeatId'
+
+    HoldPatch:
+      description: JSON Merge Patch of a hold; only the expiry can change.
+      type: object
+      additionalProperties: false
+      required: [expiresAt]
+      properties:
+        expiresAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Requested new expiry; later than the current one and within the hold extension policy ([BIZ-27], TODO).
+
+    Hold:
+      description: Temporary reservation of one seat by the calling customer.
+      type: object
+      required: [id, eventId, seat, status, createdAt, expiresAt, orderId]
+      properties:
+        id:
+          $ref: '#/components/schemas/HoldId'
+        eventId:
+          $ref: '#/components/schemas/EventId'
+        seat:
+          $ref: '#/components/schemas/SeatRef'
+        status:
+          $ref: '#/components/schemas/HoldStatus'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the hold was placed.
+        expiresAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When an ACTIVE hold expires and its seat is freed.
+        orderId:
+          description: Order the hold belongs to; `null` until it is ordered.
+          oneOf:
+            - $ref: '#/components/schemas/OrderId'
+            - type: 'null'
+
+    OrderStatus:
+      description: State of an order ([BIZ-11]); only PENDING->PAID, PENDING->CANCELLED and PAID->REFUNDED are legal ([BIZ-15]).
+      type: string
+      enum: [PENDING, PAID, CANCELLED, REFUNDED]
+
+    CancellationReason:
+      description: Why an order was cancelled ([BIZ-13]).
+      type: string
+      enum: [CUSTOMER_REQUEST, PAYMENT_DECLINED, PAYMENT_TIMED_OUT, HOLD_EXPIRED, HOLD_RELEASED]
+
+    OrderCreate:
+      description: Request to purchase held seats.
+      type: object
+      additionalProperties: false
+      required: [holdIds]
+      properties:
+        holdIds:
+          description: The caller's ACTIVE holds to purchase, all of the same event; bounded by the per-customer hold limit ([BIZ-08]).
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/HoldId'
+
+    OrderLine:
+      description: One purchased seat, with its price fixed at order creation.
+      type: object
+      required: [holdId, seat, price]
+      properties:
+        holdId:
+          $ref: '#/components/schemas/HoldId'
+        seat:
+          $ref: '#/components/schemas/SeatRef'
+        price:
+          $ref: '#/components/schemas/Money'
+
+    Order:
+      description: A purchase of one or more seats of one event, associated with a payment.
+      type: object
+      required:
+        [id, eventId, status, lines, total, paymentId, createdAt, paidAt, cancelledAt, cancellationReason, refundedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/OrderId'
+        eventId:
+          $ref: '#/components/schemas/EventId'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        lines:
+          description: Purchased seats.
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderLine'
+        total:
+          $ref: '#/components/schemas/Money'
+          description: Sum of the line prices.
+        paymentId:
+          description: Identifier of the payment assigned by Payments, used by the client to pay at the PSP.
+          type: string
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the order was created.
+        paidAt:
+          description: When the order became PAID; `null` otherwise.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        cancelledAt:
+          description: When the order became CANCELLED; `null` otherwise.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        cancellationReason:
+          description: Why the order was cancelled; `null` unless CANCELLED.
+          oneOf:
+            - $ref: '#/components/schemas/CancellationReason'
+            - type: 'null'
+        refundedAt:
+          description: When the order became REFUNDED; `null` otherwise.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+
+    OrderPage:
+      description: One page of orders.
+      type: object
+      required: [items, nextCursor, limit]
+      properties:
+        items:
+          description: Orders of this page, in the requested sort order.
+          type: array
+          items:
+            $ref: '#/components/schemas/Order'
+        nextCursor:
+          description: Cursor of the next page; `null` on the last page.
+          type: [string, 'null']
+        limit:
+          description: Page size served after clamping.
+          type: integer
+          format: int32
+
+    FieldError:
+      description: One invalid field of a request ([STY-20]).
+      type: object
+      required: [field, code, detail]
+      properties:
+        field:
+          description: Path of the invalid field, e.g. `holdIds[1]`.
+          type: string
+        code:
+          description: Stable validation code, e.g. `REQUIRED`, `INVALID_FORMAT`, `OUT_OF_RANGE`.
+          type: string
+        detail:
+          description: Human-readable explanation.
+          type: string
+
+    Problem:
+      description: |
+        RFC 9457 problem document, the single error format of the platform ([API-04]). `code` is a
+        stable machine-readable identifier that never changes once published ([STY-79]).
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type:
+          description: URI reference identifying the problem type.
+          type: string
+          format: uri-reference
+        title:
+          description: Short human-readable summary of the problem type.
+          type: string
+        status:
+          description: HTTP status code of the response.
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          description: Human-readable explanation of this occurrence.
+          type: string
+        instance:
+          description: URI reference of the request that produced the problem.
+          type: string
+          format: uri-reference
+        code:
+          description: Stable error code.
+          type: string
+        errors:
+          description: Field errors; present on validation failures.
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+  examples:
+    ValidationFailed:
+      summary: A field is missing or invalid
+      value:
+        type: /problems/validation-failed
+        title: Validation failed
+        status: 422
+        detail: The request body has invalid fields.
+        instance: /api/v1/orders
+        code: VALIDATION_FAILED
+        errors:
+          - field: holdIds
+            code: REQUIRED
+            detail: Must contain at least one hold id.
+    IdempotencyKeyInUse:
+      summary: A request with the same Idempotency-Key is still executing
+      value:
+        type: /problems/idempotency-key-in-use
+        title: Idempotency key in use
+        status: 409
+        detail: A request with this Idempotency-Key is still being processed; retry later.
+        instance: /api/v1/orders
+        code: IDEMPOTENCY_KEY_IN_USE
+    IdempotencyKeyReused:
+      summary: The Idempotency-Key was used for a different request
+      value:
+        type: /problems/idempotency-key-reused
+        title: Idempotency key reused
+        status: 422
+        detail: This Idempotency-Key was already used with a different request.
+        instance: /api/v1/orders
+        code: IDEMPOTENCY_KEY_REUSED
+    SeatUnavailable:
+      summary: The seat is already HELD or SOLD
+      value:
+        type: /problems/seat-unavailable
+        title: Seat unavailable
+        status: 409
+        detail: Seat 9001 is no longer free; choose another seat.
+        instance: /api/v1/events/413/holds
+        code: SEAT_UNAVAILABLE
+    HoldLimitReached:
+      summary: The customer reached the hold limit
+      value:
+        type: /problems/hold-limit-reached
+        title: Hold limit reached
+        status: 409
+        detail: You already hold the maximum number of seats.
+        instance: /api/v1/events/413/holds
+        code: HOLD_LIMIT_REACHED
+    SalesClosed:
+      summary: The event's sales are not open
+      value:
+        type: /problems/sales-closed
+        title: Sales closed
+        status: 409
+        detail: Sales for event 413 are not open.
+        instance: /api/v1/events/413/holds
+        code: SALES_CLOSED
+
+  responses:
+    NotModified:
+      description: The representation is unchanged since the ETag sent in `If-None-Match`; empty body ([API-32]).
+      headers:
+        ETag:
+          $ref: '#/components/headers/ETag'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+    BadRequest:
+      description: The request cannot be parsed (malformed JSON, wrong parameter type, invalid cursor).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/malformed-request
+            title: Malformed request
+            status: 400
+            detail: Query parameter limit must be an integer.
+            instance: /api/v1/events/413/seats
+            code: MALFORMED_REQUEST
+    Unauthorized:
+      description: The bearer token is missing or invalid ([SEC-06]).
+      headers:
+        WWW-Authenticate:
+          description: Authentication challenge for the bearer scheme.
+          schema:
+            type: string
+          example: Bearer
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/unauthenticated
+            title: Unauthenticated
+            status: 401
+            detail: A valid bearer token is required.
+            instance: /api/v1/orders
+            code: UNAUTHENTICATED
+    Forbidden:
+      description: The caller is authenticated but not allowed to perform the operation ([SEC-06]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/forbidden
+            title: Forbidden
+            status: 403
+            detail: This operation requires the customer role.
+            instance: /api/v1/events/413/holds
+            code: FORBIDDEN
+    EventNotFound:
+      description: The event has no seat inventory in this service.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/event-not-found
+            title: Event not found
+            status: 404
+            detail: Event 413 does not exist.
+            instance: /api/v1/events/413/seats
+            code: EVENT_NOT_FOUND
+    SeatNotFound:
+      description: The event or the seat does not exist.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/seat-not-found
+            title: Seat not found
+            status: 404
+            detail: Event 413 has no seat 9999.
+            instance: /api/v1/events/413/seats/9999
+            code: SEAT_NOT_FOUND
+    HoldNotFound:
+      description: The hold does not exist or belongs to another customer ([API-18]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/hold-not-found
+            title: Hold not found
+            status: 404
+            detail: Hold 98213 does not exist.
+            instance: /api/v1/holds/98213
+            code: HOLD_NOT_FOUND
+    OrderNotFound:
+      description: The order does not exist or belongs to another customer ([API-18]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/order-not-found
+            title: Order not found
+            status: 404
+            detail: Order 5512 does not exist.
+            instance: /api/v1/orders/5512
+            code: ORDER_NOT_FOUND
+    NotAcceptable:
+      description: The `Accept` header allows no media type this operation produces ([API-43]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/not-acceptable
+            title: Not acceptable
+            status: 406
+            detail: This operation produces application/json.
+            instance: /api/v1/orders
+            code: NOT_ACCEPTABLE
+    UnsupportedMediaType:
+      description: The `Content-Type` of the body is not accepted by this operation ([API-43]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/unsupported-media-type
+            title: Unsupported media type
+            status: 415
+            detail: This operation consumes application/json.
+            instance: /api/v1/orders
+            code: UNSUPPORTED_MEDIA_TYPE
+    TooManyRequests:
+      description: The caller exceeded its rate limit; retry after `Retry-After` seconds ([API-18], [API-46]).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/rate-limited
+            title: Too many requests
+            status: 429
+            detail: Rate limit exceeded; retry later.
+            instance: /api/v1/events/413/holds
+            code: RATE_LIMITED
+    InternalServerError:
+      description: Unexpected server failure; details are logged with the correlation id, not returned ([OPS-17]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/internal-error
+            title: Internal server error
+            status: 500
+            detail: An unexpected error occurred.
+            instance: /api/v1/orders
+            code: INTERNAL_ERROR
+    ServiceUnavailable:
+      description: The service is shedding load or a dependency (database, Payments) is unavailable; retry after `Retry-After` seconds ([API-19], [OPS-02]).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            overloaded:
+              summary: Load shedding
+              value:
+                type: /problems/service-unavailable
+                title: Service unavailable
+                status: 503
+                detail: The service is overloaded; retry later.
+                instance: /api/v1/events/413/holds
+                code: SERVICE_UNAVAILABLE
+            paymentsUnavailable:
+              summary: Payments is unavailable while creating an order
+              value:
+                type: /problems/payments-unavailable
+                title: Payments unavailable
+                status: 503
+                detail: The payment could not be requested; retry later with the same Idempotency-Key.
+                instance: /api/v1/orders
+                code: PAYMENTS_UNAVAILABLE

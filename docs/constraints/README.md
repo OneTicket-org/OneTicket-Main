@@ -17,8 +17,9 @@ Each rule carries a stable ID (`[API-07]`): prefix by file (`ARCH` this file, `B
 ### Team, scope & actors
 
 - **MUST** [ARCH-01] Teams of four students design, implement, operate and document a ticketing platform
-- **DOMAIN** [ARCH-02] The platform serves three kinds of user: organisers, customers and gate staff
-- **TODO** [ARCH-03] Define organiser and gate-staff rules (event creation, pricing) and the Keycloak roles and permissions of each actor
+- **DOMAIN** [ARCH-02] The platform serves three kinds of user: organizers, customers and gate staff
+- **TODO** [ARCH-03] Define organizer and gate-staff rules (event creation, pricing) and the permissions of each Keycloak role ([ARCH-30])
+- **DOMAIN** [ARCH-30] Each actor maps to one Keycloak role: `customer`, `organizer`, `gate-staff`
 - **INFO** [ARCH-04] The client is an SPA; frontend frameworks, mobile clients, data engineering and Kubernetes internals are out of scope
 - **INFO** [ARCH-05] In the project, work is parallel: SPA, services and integration are built at the same time, by different people, against the same API
 

@@ -14,7 +14,7 @@ Two placements were viable for seat state and holds: next to the event data in C
 - a cancelled order releases its held seats ([BIZ-13]);
 - a hold may expire while its order is still pending ([BIZ-10], open).
 
-The two data sets also behave differently. Events and venues are written rarely by organisers, mostly before sales open, are read-heavy and cacheable for minutes ([API-31]). Seat state changes on every hold, is not cacheable ([API-31]), and concentrates write contention on hot rows at sales opening, where the database fails first ([OPS-07]).
+The two data sets also behave differently. Events and venues are written rarely by organizers, mostly before sales open, are read-heavy and cacheable for minutes ([API-31]). Seat state changes on every hold, is not cacheable ([API-31]), and concentrates write contention on hot rows at sales opening, where the database fails first ([OPS-07]).
 
 ## Decision
 
