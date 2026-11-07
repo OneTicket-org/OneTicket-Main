@@ -36,11 +36,12 @@ stateDiagram-v2
 ### Order lifecycle
 
 - **DOMAIN** [BIZ-11] An order is created as `PENDING`, and has only one state between `PENDING`, `PAID`, `CANCELLED` or `REFUNDED`
-- **DOMAIN** [BIZ-12] Payment: `PENDING` -> `PAID`, set from the synchronous response of the external payment service reporting a successful payment
+- **DOMAIN** [BIZ-12] Payment: `PENDING` -> `PAID`, set when the PSP reports a successful payment: the PSP's webhook reaches Payments, which notifies Inventory & Orders with an asynchronous message ([ARCH-16], [ADR-0003](../adr/0003-psp-webhook-authentication.md))
 - **DOMAIN** [BIZ-13] Cancellation: `PENDING` -> `CANCELLED`, covering every unsuccessful outcome (payment declined or timed out, hold expired or released); the order's held seats are released by the service
 - **DOMAIN** [BIZ-14] Refund: `PAID` -> `REFUNDED`, customer asks for a refund
 - **DOMAIN** [BIZ-15] Illegal transitions are refused: e.g. CANCELLED → PAID never
 - **TODO** [BIZ-28] Define what happens when a customer cancels a `PENDING` order while its payment is still in progress at the PSP
+- **TODO** [BIZ-29] Define the refund eligibility policy: until when (relative to the event start) a paid order may be refunded, and whether any fee is retained
 
 ### Payments
 

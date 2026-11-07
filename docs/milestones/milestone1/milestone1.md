@@ -25,7 +25,7 @@
 * As a customer, I want to buy ticket(s) for an event
 * As a customer, I want to receive tickets I bought on my personal email
 * As a customer, I want to review past orders on the ticketing platform
-* As a customer, I want to ask for a refund for a ticket I previously bought
+* As a customer, I want to ask for a refund for an order I previously bought
 * As a gate staff person, I want to scan a customer's ticket to understand if it's valid for the event they're attending
 
 ## Service Decomposition

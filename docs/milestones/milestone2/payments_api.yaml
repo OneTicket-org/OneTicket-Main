@@ -1,0 +1,1038 @@
+openapi: 3.1.0
+info:
+  title: OneTicket Payments API
+  version: 0.1.0-draft
+  summary: Payments and refunds of the OneTicket platform, and PSP webhooks.
+  description: |
+    Draft contract of the Payments service (Kotlin/Spring Boot). The service owns payments, refunds
+    and the accounting record, and is the only service talking to the external PSP ([BIZ-16]).
+
+    ## Payment flow
+
+    1. Inventory & Orders creates a PENDING order and calls `createPayment` with a service token
+       ([ARCH-31]); Payments registers the payment at the PSP and returns it, PENDING.
+    2. The customer pays at the PSP using the payment `id`.
+    3. The PSP reports the outcome with a webhook (`receivePspEvent`, [ADR-0003](../../adr/0003-psp-webhook-authentication.md)).
+    4. Payments records the outcome and notifies Inventory & Orders with an asynchronous message
+       ([BIZ-12], [ARCH-16]); the order becomes PAID, or CANCELLED on a declined or timed-out payment
+       ([BIZ-13]).
+
+    Refunds cover a whole order ([BIZ-14]): the customer requests one with `requestRefund`, Payments
+    executes it at the PSP asynchronously, and on success notifies Inventory & Orders, which applies
+    `PAID -> REFUNDED` and frees the seats ([BIZ-07]).
+
+    ## Conventions
+
+    - **Base path**: every operation is mounted once under `/api/v1` ([API-10]); the API version is
+      carried by the URI.
+    - **Authentication**: Keycloak-issued bearer JWT ([SEC-03], [SEC-05]). Keycloak roles are
+      `customer`, `organizer` and `gate-staff` ([ARCH-30]), plus `service` for service-to-service
+      calls ([ARCH-31]); the global requirement is the `customer` role, overridden per operation.
+      Service-only operations reject end-user tokens and are not routed by the edge. PSP webhooks are
+      authenticated by the PSP signature instead ([ADR-0003](../../adr/0003-psp-webhook-authentication.md)).
+    - **Errors**: `application/problem+json` (RFC 9457) carrying a stable `code` ([API-04], [STY-79]);
+      `422` bodies list field errors as `{field, code, detail}` ([STY-20]).
+    - **Idempotency**: every `POST` called by a client or a service requires an `Idempotency-Key` (a
+      UUID generated once per logical operation and reused on each retry of it) ([API-23], [API-24]).
+      A finished key replays the stored status and body without re-executing; a key still executing
+      answers `409 IDEMPOTENCY_KEY_IN_USE`; a key reused with a different method, URI or body answers
+      `422 IDEMPOTENCY_KEY_REUSED` ([API-25], [API-26]). Keys are retained for 24 hours (set in
+      configuration [OPS-26]): a retry is safe within that window ([API-27]). PSP webhooks are
+      deduplicated by the PSP event identifier instead ([BIZ-18]).
+    - **Concurrency**: payments and refunds carry a row version exposed as a strong `ETag`; reads accept
+      `If-None-Match` and answer `304` when unchanged ([API-32], [API-34]). Clients never write them
+      directly, so no operation takes `If-Match`.
+    - **Caching**: payments and refunds are personal data and `Cache-Control: no-store` ([API-30]).
+    - **Strictness**: request bodies reject unknown fields and implicit type coercion ([API-51],
+      [API-52]); timestamps are ISO 8601 with an explicit UTC offset, timestamps without offset are
+      rejected ([API-05]); money is an object with a string amount and an ISO 4217 currency ([BIZ-24]).
+    - **Correlation**: `X-Request-Id` is reused from the request or generated, and returned on every
+      response ([OPS-12]).
+    - **Overload**: `429` and `503` carry `Retry-After` ([API-19], [API-46]); calls to the PSP go
+      through a circuit breaker and a dedicated bulkhead ([OPS-02], [OPS-03]).
+
+    ## Not covered by this draft
+
+    The asynchronous messages to Inventory & Orders (payment succeeded / failed, refund succeeded;
+    [ARCH-16]), the payment timeout value (set in configuration, [OPS-26]), a payment that succeeds at
+    the PSP after its hold expired or its order was cancelled (**TODO** [BIZ-10], [BIZ-28]), refund
+    eligibility (**TODO** [BIZ-29]), where processed webhook identifiers and idempotency keys are stored
+    (**TODO** [BIZ-19]), the exact PSP signature scheme and event payload (they follow the PSP
+    sandbox, [ADR-0003](../../adr/0003-psp-webhook-authentication.md)), refunds of single tickets,
+    accounting-record and organizer reporting endpoints, health endpoints (outside `/api/v1`,
+    [API-10]).
+
+servers:
+  - url: /api/v1
+    description: Version 1 of the API, mounted once ([API-10]).
+
+security:
+  - bearerAuth: [customer]
+
+tags:
+  - name: Payments
+    description: Payments of orders at the PSP, one per order.
+  - name: Refunds
+    description: Reversals of a successful payment, covering the whole order ([BIZ-07], [BIZ-14]).
+  - name: PSP events
+    description: Webhook deliveries from the PSP reporting payment and refund outcomes ([BIZ-18]).
+
+paths:
+  /payments:
+    post:
+      operationId: createPayment
+      tags: [Payments]
+      summary: Request the payment of an order
+      description: |
+        Service operation, called by Inventory & Orders after creating a PENDING order ([ARCH-31]); not
+        routed by the edge. Registers the payment at the PSP and returns it PENDING; the customer then
+        pays at the PSP with the payment `id`.
+
+        - An order has at most one payment: a second payment for the same order with a different
+          `Idempotency-Key` fails with `409 ORDER_ALREADY_HAS_PAYMENT`, so a retried purchase never
+          charges twice ([BIZ-17]). Retries of the same attempt reuse the key and get the stored
+          response.
+        - If the PSP cannot be reached, nothing is created and the call fails with
+          `503 PSP_UNAVAILABLE`; the caller retries with the same key.
+        - A payment not completed at the PSP within the payment timeout (set in configuration,
+          [OPS-26]) becomes TIMED_OUT.
+      security:
+        - bearerAuth: [service]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        description: The order to pay, its customer and its total.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentCreate'
+            example:
+              orderId: 5512
+              customerId: b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+              amount:
+                amount: '90.20'
+                currency: EUR
+      responses:
+        '201':
+          description: The payment is registered at the PSP and PENDING.
+          headers:
+            Location:
+              $ref: '#/components/headers/PaymentLocation'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+              example:
+                id: pay_01J8Z3Q4M2
+                orderId: 5512
+                amount:
+                  amount: '90.20'
+                  currency: EUR
+                status: PENDING
+                createdAt: '2029-09-01T20:52:00+02:00'
+                completedAt: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ServiceForbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: The order already has a payment, or the same request is still executing.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                orderAlreadyHasPayment:
+                  summary: The order already has a payment
+                  value:
+                    type: /problems/order-already-has-payment
+                    title: Order already has a payment
+                    status: 409
+                    detail: Order 5512 already has payment pay_01J8Z3Q4M2.
+                    instance: /api/v1/payments
+                    code: ORDER_ALREADY_HAS_PAYMENT
+                idempotencyKeyInUse:
+                  $ref: '#/components/examples/IdempotencyKeyInUse'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          description: The body is well formed but invalid.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                validationFailed:
+                  summary: A field is missing or invalid
+                  value:
+                    type: /problems/validation-failed
+                    title: Validation failed
+                    status: 422
+                    detail: The request body has invalid fields.
+                    instance: /api/v1/payments
+                    code: VALIDATION_FAILED
+                    errors:
+                      - field: amount.amount
+                        code: OUT_OF_RANGE
+                        detail: Must be greater than zero.
+                idempotencyKeyReused:
+                  $ref: '#/components/examples/IdempotencyKeyReused'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/PspUnavailable'
+
+  /payments/{paymentId}:
+    get:
+      operationId: getPayment
+      tags: [Payments]
+      summary: Get a payment
+      description: |
+        Customer or service operation. A customer reads only the payments of their own orders; another
+        customer's payment answers `404` ([API-18]). `If-None-Match` answers `304` when the payment is
+        unchanged.
+      security:
+        - bearerAuth: [customer]
+        - bearerAuth: [service]
+      parameters:
+        - $ref: '#/components/parameters/PaymentId'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The payment.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+              example:
+                id: pay_01J8Z3Q4M2
+                orderId: 5512
+                amount:
+                  amount: '90.20'
+                  currency: EUR
+                status: SUCCEEDED
+                createdAt: '2029-09-01T20:52:00+02:00'
+                completedAt: '2029-09-01T20:54:10+02:00'
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PaymentNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /payments/{paymentId}/refunds:
+    post:
+      operationId: requestRefund
+      tags: [Refunds]
+      summary: Request the refund of a paid order
+      description: |
+        Customer operation. Requests the refund of the whole amount of one of the caller's SUCCEEDED
+        payments ([BIZ-14]); single tickets cannot be refunded. The refund is executed at the PSP
+        asynchronously: the response is `202` with the PENDING refund, whose progress is observed at
+        `Location` ([API-17]). On success the payment becomes REFUNDED and Inventory & Orders is
+        notified, which applies `PAID -> REFUNDED` to the order and frees its seats ([BIZ-07]).
+
+        - Another customer's payment answers `404` ([API-18]).
+        - A payment that is not SUCCEEDED cannot be refunded: `409 PAYMENT_NOT_REFUNDABLE`.
+        - A payment has at most one active or succeeded refund: a new request while one is PENDING or
+          SUCCEEDED fails with `409 REFUND_ALREADY_REQUESTED`; after a FAILED refund a new one may be
+          requested.
+
+        **TODO** [BIZ-29]: the refund eligibility policy (deadline relative to the event, retained
+        fees) is still to be defined.
+      parameters:
+        - $ref: '#/components/parameters/PaymentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '202':
+          description: The refund is accepted and PENDING at the PSP.
+          headers:
+            Location:
+              $ref: '#/components/headers/RefundLocation'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+              example:
+                id: rfd_01J9A7K2XQ
+                paymentId: pay_01J8Z3Q4M2
+                orderId: 5512
+                amount:
+                  amount: '90.20'
+                  currency: EUR
+                status: PENDING
+                requestedAt: '2029-09-01T20:58:00+02:00'
+                completedAt: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/PaymentNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: The payment cannot be refunded in its current state.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                paymentNotRefundable:
+                  summary: The payment did not succeed
+                  value:
+                    type: /problems/payment-not-refundable
+                    title: Payment not refundable
+                    status: 409
+                    detail: Payment pay_01J8Z3Q4M2 is DECLINED; only a succeeded payment can be refunded.
+                    instance: /api/v1/payments/pay_01J8Z3Q4M2/refunds
+                    code: PAYMENT_NOT_REFUNDABLE
+                refundAlreadyRequested:
+                  summary: A refund is already pending or succeeded
+                  value:
+                    type: /problems/refund-already-requested
+                    title: Refund already requested
+                    status: 409
+                    detail: Payment pay_01J8Z3Q4M2 already has refund rfd_01J9A7K2XQ.
+                    instance: /api/v1/payments/pay_01J8Z3Q4M2/refunds
+                    code: REFUND_ALREADY_REQUESTED
+                idempotencyKeyInUse:
+                  $ref: '#/components/examples/IdempotencyKeyInUse'
+        '422':
+          description: The idempotency key was already used for a different request.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                idempotencyKeyReused:
+                  $ref: '#/components/examples/IdempotencyKeyReused'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /refunds/{refundId}:
+    get:
+      operationId: getRefund
+      tags: [Refunds]
+      summary: Get a refund
+      description: |
+        Customer or service operation. A customer reads only the refunds of their own payments; another
+        customer's refund answers `404` ([API-18]). `If-None-Match` answers `304` when the refund is
+        unchanged.
+      security:
+        - bearerAuth: [customer]
+        - bearerAuth: [service]
+      parameters:
+        - $ref: '#/components/parameters/RefundId'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The refund.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+              example:
+                id: rfd_01J9A7K2XQ
+                paymentId: pay_01J8Z3Q4M2
+                orderId: 5512
+                amount:
+                  amount: '90.20'
+                  currency: EUR
+                status: SUCCEEDED
+                requestedAt: '2029-09-01T20:58:00+02:00'
+                completedAt: '2029-09-01T20:58:42+02:00'
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/RefundNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /psp-events:
+    post:
+      operationId: receivePspEvent
+      tags: [PSP events]
+      summary: Receive a PSP webhook delivery
+      description: |
+        PSP operation ([ADR-0003](../../adr/0003-psp-webhook-authentication.md)). Authenticated by the
+        PSP signature over the raw body, verified before parsing; no Keycloak token.
+
+        - Deliveries are at least once: an event whose `id` was already processed answers `204` without
+          re-executing ([BIZ-18]).
+        - Events may arrive out of order ([BIZ-16]): an event that would cause an illegal transition
+          (e.g. a failure after a success, a success after a timeout) is recorded and answers `204`
+          without changing state; the late-success case is open (**TODO** [BIZ-10], [BIZ-28]).
+        - An event for an unknown payment or refund is recorded and answers `204`, so the PSP does not
+          redeliver it forever.
+        - A processed outcome is published to Inventory & Orders as an asynchronous message
+          ([BIZ-12], [ARCH-16]).
+
+        The payload shape follows the PSP sandbox; the schema lists the fields Payments relies on.
+      security:
+        - pspSignature: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        description: The PSP event.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PspEvent'
+            example:
+              id: evt_7Hq2LmN4pR
+              type: payment.succeeded
+              paymentId: pay_01J8Z3Q4M2
+              refundId: null
+              occurredAt: '2029-09-01T18:54:09Z'
+      responses:
+        '204':
+          description: The event is processed, or was already processed, or is recorded and ignored.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: The signature is missing or invalid; the delivery is not processed.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: /problems/invalid-signature
+                title: Invalid signature
+                status: 401
+                detail: The webhook signature could not be verified.
+                instance: /api/v1/psp-events
+                code: INVALID_SIGNATURE
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Keycloak-issued access token, verified by signature on every request ([SEC-02], [SEC-03]).
+        Security requirements list the Keycloak role the operation requires: `customer`, `organizer`,
+        `gate-staff` ([ARCH-30]) or `service` for client-credentials tokens of other services
+        ([ARCH-31]).
+    pspSignature:
+      type: apiKey
+      in: header
+      name: PSP-Signature
+      description: |
+        Signature of the raw request body computed by the PSP with the webhook secret shared with
+        Payments ([ADR-0003](../../adr/0003-psp-webhook-authentication.md), [SEC-07]). Header name,
+        algorithm and replay window follow the PSP sandbox's documentation.
+
+  parameters:
+    PaymentId:
+      name: paymentId
+      in: path
+      required: true
+      description: Identifier of the payment.
+      schema:
+        $ref: '#/components/schemas/PaymentId'
+      example: pay_01J8Z3Q4M2
+    RefundId:
+      name: refundId
+      in: path
+      required: true
+      description: Identifier of the refund.
+      schema:
+        $ref: '#/components/schemas/RefundId'
+      example: rfd_01J9A7K2XQ
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID identifying one logical operation, reused on every retry of it ([API-24]); retained for 24 hours.
+      schema:
+        type: string
+        format: uuid
+      example: 5f0c1c1e-3f4b-4f43-9d7e-2b8a3c7d9e10
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: ETag of the representation held by the client; the server answers 304 if it still matches.
+      schema:
+        type: string
+      example: '"v2"'
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Correlation id of the request; generated by the server when absent and returned on the response ([OPS-12]).
+      schema:
+        type: string
+        maxLength: 128
+      example: 0b6f3c4e-8a2d-4c1f-9e7b-5d3a2f1c0e9d
+
+  headers:
+    RequestId:
+      description: Correlation id of the request, reused from the request or generated ([OPS-12]).
+      schema:
+        type: string
+      example: 0b6f3c4e-8a2d-4c1f-9e7b-5d3a2f1c0e9d
+    ETag:
+      description: Strong entity tag carrying the row version of the resource.
+      schema:
+        type: string
+      example: '"v2"'
+    PaymentLocation:
+      description: URI of the created payment ([API-17]).
+      schema:
+        type: string
+        format: uri-reference
+      example: /api/v1/payments/pay_01J8Z3Q4M2
+    RefundLocation:
+      description: URI of the refund, where its progress is observed ([API-17]).
+      schema:
+        type: string
+        format: uri-reference
+      example: /api/v1/refunds/rfd_01J9A7K2XQ
+    CacheControlNoStore:
+      description: The response must not be stored by any cache ([API-30]).
+      schema:
+        type: string
+        const: no-store
+      example: no-store
+    RetryAfter:
+      description: Seconds the client should wait before retrying, with backoff ([API-46]).
+      schema:
+        type: integer
+        minimum: 0
+      example: 5
+
+  schemas:
+    PaymentId:
+      description: Identifier of a payment, assigned by Payments and used by the customer to pay at the PSP.
+      type: string
+      pattern: '^pay_[0-9A-Z]{10,26}$'
+    RefundId:
+      description: Identifier of a refund, assigned by Payments.
+      type: string
+      pattern: '^rfd_[0-9A-Z]{10,26}$'
+    OrderId:
+      description: Identifier of an order, assigned by Inventory & Orders.
+      type: integer
+      format: int64
+      minimum: 1
+    CustomerId:
+      description: Keycloak subject (`sub` claim) of the customer who placed the order.
+      type: string
+      format: uuid
+
+    Timestamp:
+      description: ISO 8601 timestamp with an explicit UTC offset ([API-05]).
+      type: string
+      format: date-time
+
+    Money:
+      description: Exact amount of money with its ISO 4217 currency ([BIZ-24]).
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          description: Decimal amount as a string with two fraction digits, fitting NUMERIC(12,2) ([BIZ-23]).
+          type: string
+          pattern: '^-?[0-9]{1,10}\.[0-9]{2}$'
+        currency:
+          description: ISO 4217 alphabetic currency code.
+          type: string
+          pattern: '^[A-Z]{3}$'
+
+    PaymentStatus:
+      description: |
+        State of a payment. PENDING awaits the PSP outcome; SUCCEEDED was confirmed by the PSP; DECLINED
+        was refused by the PSP; TIMED_OUT got no outcome within the payment timeout; REFUNDED was
+        reversed by a succeeded refund. Only PENDING -> SUCCEEDED | DECLINED | TIMED_OUT and
+        SUCCEEDED -> REFUNDED are legal ([BIZ-15]).
+      type: string
+      enum: [PENDING, SUCCEEDED, DECLINED, TIMED_OUT, REFUNDED]
+
+    PaymentCreate:
+      description: Request to pay an order.
+      type: object
+      additionalProperties: false
+      required: [orderId, customerId, amount]
+      properties:
+        orderId:
+          $ref: '#/components/schemas/OrderId'
+        customerId:
+          $ref: '#/components/schemas/CustomerId'
+        amount:
+          $ref: '#/components/schemas/Money'
+          description: Total of the order; greater than zero.
+
+    Payment:
+      description: The payment of one order at the PSP.
+      type: object
+      required: [id, orderId, amount, status, createdAt, completedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/PaymentId'
+        orderId:
+          $ref: '#/components/schemas/OrderId'
+        amount:
+          $ref: '#/components/schemas/Money'
+          description: Amount charged.
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the payment was registered at the PSP.
+        completedAt:
+          description: When the payment left PENDING; `null` while PENDING.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+
+    RefundStatus:
+      description: State of a refund. PENDING is being executed at the PSP; SUCCEEDED returned the money; FAILED was refused by the PSP and may be requested again.
+      type: string
+      enum: [PENDING, SUCCEEDED, FAILED]
+
+    Refund:
+      description: Reversal of the whole amount of a succeeded payment ([BIZ-07], [BIZ-14]).
+      type: object
+      required: [id, paymentId, orderId, amount, status, requestedAt, completedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/RefundId'
+        paymentId:
+          $ref: '#/components/schemas/PaymentId'
+        orderId:
+          $ref: '#/components/schemas/OrderId'
+        amount:
+          $ref: '#/components/schemas/Money'
+          description: Amount returned; the whole payment amount.
+        status:
+          $ref: '#/components/schemas/RefundStatus'
+        requestedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the customer requested the refund.
+        completedAt:
+          description: When the refund left PENDING; `null` while PENDING.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+
+    PspEventType:
+      description: Kind of outcome reported by the PSP.
+      type: string
+      enum: [payment.succeeded, payment.failed, refund.succeeded, refund.failed]
+
+    PspEvent:
+      description: |
+        Webhook payload of the PSP, limited to the fields Payments relies on; its exact shape follows
+        the PSP sandbox ([ADR-0003](../../adr/0003-psp-webhook-authentication.md)). Unknown fields are
+        tolerated here, unlike client requests, because the PSP owns the format.
+      type: object
+      required: [id, type, paymentId, refundId, occurredAt]
+      properties:
+        id:
+          description: PSP event identifier, used to discard duplicate deliveries ([BIZ-18]).
+          type: string
+          minLength: 1
+          maxLength: 255
+        type:
+          $ref: '#/components/schemas/PspEventType'
+        paymentId:
+          $ref: '#/components/schemas/PaymentId'
+        refundId:
+          description: Refund concerned by `refund.*` events; `null` for `payment.*` events.
+          oneOf:
+            - $ref: '#/components/schemas/RefundId'
+            - type: 'null'
+        occurredAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the outcome happened at the PSP.
+
+    FieldError:
+      description: One invalid field of a request ([STY-20]).
+      type: object
+      required: [field, code, detail]
+      properties:
+        field:
+          description: Path of the invalid field, e.g. `amount.amount`.
+          type: string
+        code:
+          description: Stable validation code, e.g. `REQUIRED`, `INVALID_FORMAT`, `OUT_OF_RANGE`.
+          type: string
+        detail:
+          description: Human-readable explanation.
+          type: string
+
+    Problem:
+      description: |
+        RFC 9457 problem document, the single error format of the platform ([API-04]). `code` is a
+        stable machine-readable identifier that never changes once published ([STY-79]).
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type:
+          description: URI reference identifying the problem type.
+          type: string
+          format: uri-reference
+        title:
+          description: Short human-readable summary of the problem type.
+          type: string
+        status:
+          description: HTTP status code of the response.
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          description: Human-readable explanation of this occurrence.
+          type: string
+        instance:
+          description: URI reference of the request that produced the problem.
+          type: string
+          format: uri-reference
+        code:
+          description: Stable error code.
+          type: string
+        errors:
+          description: Field errors; present on validation failures.
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+  examples:
+    IdempotencyKeyInUse:
+      summary: A request with the same Idempotency-Key is still executing
+      value:
+        type: /problems/idempotency-key-in-use
+        title: Idempotency key in use
+        status: 409
+        detail: A request with this Idempotency-Key is still being processed; retry later.
+        instance: /api/v1/payments
+        code: IDEMPOTENCY_KEY_IN_USE
+    IdempotencyKeyReused:
+      summary: The Idempotency-Key was used for a different request
+      value:
+        type: /problems/idempotency-key-reused
+        title: Idempotency key reused
+        status: 422
+        detail: This Idempotency-Key was already used with a different request.
+        instance: /api/v1/payments
+        code: IDEMPOTENCY_KEY_REUSED
+
+  responses:
+    NotModified:
+      description: The representation is unchanged since the ETag sent in `If-None-Match`; empty body ([API-32]).
+      headers:
+        ETag:
+          $ref: '#/components/headers/ETag'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+    BadRequest:
+      description: The request cannot be parsed (malformed JSON, wrong parameter type, timestamp without offset).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/malformed-request
+            title: Malformed request
+            status: 400
+            detail: The request body is not valid JSON.
+            instance: /api/v1/payments
+            code: MALFORMED_REQUEST
+    Unauthorized:
+      description: The bearer token is missing or invalid ([SEC-06]).
+      headers:
+        WWW-Authenticate:
+          description: Authentication challenge for the bearer scheme.
+          schema:
+            type: string
+          example: Bearer
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/unauthenticated
+            title: Unauthenticated
+            status: 401
+            detail: A valid bearer token is required.
+            instance: /api/v1/payments/pay_01J8Z3Q4M2
+            code: UNAUTHENTICATED
+    Forbidden:
+      description: The caller is authenticated but lacks the role the operation requires ([SEC-06]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/forbidden
+            title: Forbidden
+            status: 403
+            detail: This operation requires the customer role.
+            instance: /api/v1/payments/pay_01J8Z3Q4M2/refunds
+            code: FORBIDDEN
+    ServiceForbidden:
+      description: The token is valid but does not carry the `service` role; end-user tokens are rejected ([ARCH-31], [SEC-06]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/forbidden
+            title: Forbidden
+            status: 403
+            detail: This operation is reserved to platform services.
+            instance: /api/v1/payments
+            code: FORBIDDEN
+    PaymentNotFound:
+      description: The payment does not exist or belongs to another customer ([API-18]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/payment-not-found
+            title: Payment not found
+            status: 404
+            detail: Payment pay_01J8Z3Q4M2 does not exist.
+            instance: /api/v1/payments/pay_01J8Z3Q4M2
+            code: PAYMENT_NOT_FOUND
+    RefundNotFound:
+      description: The refund does not exist or belongs to another customer ([API-18]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/refund-not-found
+            title: Refund not found
+            status: 404
+            detail: Refund rfd_01J9A7K2XQ does not exist.
+            instance: /api/v1/refunds/rfd_01J9A7K2XQ
+            code: REFUND_NOT_FOUND
+    NotAcceptable:
+      description: The `Accept` header allows no media type this operation produces ([API-43]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/not-acceptable
+            title: Not acceptable
+            status: 406
+            detail: This operation produces application/json.
+            instance: /api/v1/payments/pay_01J8Z3Q4M2
+            code: NOT_ACCEPTABLE
+    UnsupportedMediaType:
+      description: The `Content-Type` of the body is not accepted by this operation ([API-43]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/unsupported-media-type
+            title: Unsupported media type
+            status: 415
+            detail: This operation consumes application/json.
+            instance: /api/v1/payments
+            code: UNSUPPORTED_MEDIA_TYPE
+    TooManyRequests:
+      description: The caller exceeded its rate limit; retry after `Retry-After` seconds ([API-18], [API-46]).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/rate-limited
+            title: Too many requests
+            status: 429
+            detail: Rate limit exceeded; retry later.
+            instance: /api/v1/payments/pay_01J8Z3Q4M2/refunds
+            code: RATE_LIMITED
+    InternalServerError:
+      description: Unexpected server failure; details are logged with the correlation id, not returned ([OPS-17]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/internal-error
+            title: Internal server error
+            status: 500
+            detail: An unexpected error occurred.
+            instance: /api/v1/payments
+            code: INTERNAL_ERROR
+    ServiceUnavailable:
+      description: The service is shedding load or its database is unavailable; retry after `Retry-After` seconds ([API-19], [OPS-02]).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/service-unavailable
+            title: Service unavailable
+            status: 503
+            detail: The service is overloaded; retry later.
+            instance: /api/v1/payments/pay_01J8Z3Q4M2
+            code: SERVICE_UNAVAILABLE
+    PspUnavailable:
+      description: The service is shedding load, or the PSP cannot be reached (circuit open or timeout); nothing was created; retry after `Retry-After` seconds with the same `Idempotency-Key` ([API-19], [OPS-02]).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            overloaded:
+              summary: Load shedding
+              value:
+                type: /problems/service-unavailable
+                title: Service unavailable
+                status: 503
+                detail: The service is overloaded; retry later.
+                instance: /api/v1/payments
+                code: SERVICE_UNAVAILABLE
+            pspUnavailable:
+              summary: The PSP cannot be reached
+              value:
+                type: /problems/psp-unavailable
+                title: PSP unavailable
+                status: 503
+                detail: The payment provider could not be reached; retry later with the same Idempotency-Key.
+                instance: /api/v1/payments
+                code: PSP_UNAVAILABLE

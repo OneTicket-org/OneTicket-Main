@@ -15,6 +15,9 @@ info:
     - **Authentication**: Keycloak-issued bearer JWT ([SEC-03], [SEC-05]). Keycloak roles are
       `customer`, `organizer` and `gate-staff` ([ARCH-30]); the global requirement is the `customer`
       role, overridden per operation. Seat reads are public: no token required ([ADR-0002](../../adr/0002-public-seat-map.md)).
+    - **Outbound calls**: the service calls Payments' `createPayment` (`POST /api/v1/payments`) with a
+      Keycloak client-credentials token carrying the `service` role, never the customer's token
+      ([ARCH-31]); see `createOrder`.
     - **Errors**: `application/problem+json` (RFC 9457) carrying a stable `code` ([API-04], [STY-79]);
       `422` bodies list field errors as `{field, code, detail}` ([STY-20]).
     - **Idempotency**: every `POST` requires an `Idempotency-Key` (a UUID generated once per logical
@@ -582,6 +585,20 @@ paths:
 
         `Idempotency-Key` guarantees that a retried purchase never creates a second order nor a second
         payment ([BIZ-17]). Each order line stores the seat price at creation time.
+
+        **Call to Payments.** The payment is requested with Payments' `createPayment`
+        (`POST /api/v1/payments`, [payments_api.yaml](payments_api.yaml)):
+
+        - authenticated with the service's own Keycloak client-credentials token, `service` role
+          ([ARCH-31]); the customer's token is never forwarded;
+        - body: `orderId`, `customerId` (the `sub` claim of the caller's token, so Payments can restrict
+          payment and refund reads to that customer) and `amount` (the order `total`);
+        - `Idempotency-Key`: a UUID generated once per order and stored with it, reused on every retry
+          of the call ([API-24]), so a retry never registers a second payment; Payments also refuses a
+          second payment for the same order (`409 ORDER_ALREADY_HAS_PAYMENT`);
+        - never inside the database transaction ([SVC-19]); if Payments or the PSP is unavailable the
+          request fails with `503 PAYMENTS_UNAVAILABLE`, and the client retries with the same
+          `Idempotency-Key`.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/RequestId'

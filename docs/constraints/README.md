@@ -20,6 +20,7 @@ Each rule carries a stable ID (`[API-07]`): prefix by file (`ARCH` this file, `B
 - **DOMAIN** [ARCH-02] The platform serves three kinds of user: organizers, customers and gate staff
 - **TODO** [ARCH-03] Define organizer and gate-staff rules (event creation, pricing) and the permissions of each Keycloak role ([ARCH-30])
 - **DOMAIN** [ARCH-30] Each actor maps to one Keycloak role: `customer`, `organizer`, `gate-staff`
+- **MUST** [ARCH-31] Service-to-service calls carry a Keycloak client-credentials token with the `service` role; operations reserved to services require that role, reject end-user tokens, and are not routed by the edge from outside
 - **INFO** [ARCH-04] The client is an SPA; frontend frameworks, mobile clients, data engineering and Kubernetes internals are out of scope
 - **INFO** [ARCH-05] In the project, work is parallel: SPA, services and integration are built at the same time, by different people, against the same API
 
