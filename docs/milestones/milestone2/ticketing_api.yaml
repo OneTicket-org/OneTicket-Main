@@ -1,0 +1,1002 @@
+openapi: 3.1.0
+info:
+  title: OneTicket Ticketing API
+  version: 0.1.0-draft
+  summary: Issued tickets and their validation at the venue entrance.
+  description: |
+    Draft contract of the Ticketing service (Rust/Axum). The service owns issued tickets, their PDF
+    documents (stored in object storage, [ARCH-19]) and the scans recorded at the venue entrance.
+
+    ## Ticket lifecycle
+
+    1. When an order becomes PAID, Ticketing receives an asynchronous message and issues one ticket
+       per seat of the order ([BIZ-20], [BIZ-25]); the ticket is VALID.
+    2. The ticket PDF is rendered and stored in object storage afterwards; rendering is deferrable and
+       its failure does not invalidate the ticket ([BIZ-21]). `documentReady` tells whether the PDF can
+       be downloaded.
+    3. At the entrance, gate staff scan the ticket's QR code, which carries the ticket `id`. The first
+       scan admits and marks the ticket SCANNED; every later scan answers the same "already scanned"
+       outcome ([BIZ-26]).
+    4. When the order is refunded, the tickets become REVOKED and are refused at the entrance
+       ([BIZ-07]).
+
+    Ticket identifiers are random UUIDs (version 4, 122 random bits), never sequential nor derived
+    from other data: holding the identifier is what proves possession of the ticket, so a forged QR
+    code would have to guess one.
+
+    ## Conventions
+
+    - **Base path**: every operation is mounted once under `/api/v1` ([API-10]); the API version is
+      carried by the URI.
+    - **Authentication**: Keycloak-issued bearer JWT ([SEC-03], [SEC-05]). Keycloak roles are
+      `customer`, `organizer` and `gate-staff` ([ARCH-30]); the global requirement is the `customer`
+      role, overridden per operation. Scans require `gate-staff`.
+    - **Errors**: `application/problem+json` (RFC 9457) carrying a stable `code` ([API-04], [STY-79]);
+      `422` bodies list field errors as `{field, code, detail}` ([STY-20]).
+    - **Idempotency**: every `POST` requires an `Idempotency-Key` (a UUID generated once per logical
+      operation and reused on each retry of it) ([API-23], [API-24]). A finished key replays the stored
+      status and body without re-executing; a key still executing answers `409 IDEMPOTENCY_KEY_IN_USE`;
+      a key reused with a different method, URI or body answers `422 IDEMPOTENCY_KEY_REUSED`
+      ([API-25], [API-26]). Keys are retained for 24 hours (set in configuration [OPS-26]): a retry
+      is safe within that window ([API-27]).
+    - **Pagination**: cursor (keyset) pagination with the envelope `{items, nextCursor, limit}`
+      ([API-35], [API-38]). `limit` defaults to 50 and is clamped to 200 (set in configuration
+      [OPS-26]); the served value is echoed in `limit` ([API-37]). The cursor is opaque
+      ([API-36]), bound to the filters and sort it was issued for, and `nextCursor` is `null` on the
+      last page. Collections report no total count ([API-39]).
+    - **Media types**: ticket metadata is `application/json`, the ticket document `application/pdf`,
+      selected on the same resource with `Accept` ([API-41], [API-43]).
+    - **Concurrency**: tickets carry a row version exposed as a strong `ETag` on their JSON
+      representation; reads accept `If-None-Match` and answer `304` when unchanged ([API-32],
+      [API-34]). Clients never write tickets directly, so no operation takes `If-Match`.
+    - **Caching**: tickets and scans are personal data and `Cache-Control: no-store` ([API-30]).
+    - **Strictness**: request bodies reject unknown fields and implicit type coercion ([API-51],
+      [API-52]); timestamps are ISO 8601 with an explicit UTC offset, timestamps without offset are
+      rejected ([API-05]).
+    - **Correlation**: `X-Request-Id` is reused from the request or generated, and returned on every
+      response ([OPS-12]).
+    - **Overload**: `429` and `503` carry `Retry-After` ([API-19], [API-46]).
+
+    ## Not covered by this draft
+
+    Ticket issuance and revocation (asynchronous messages for paid and refunded orders, [ARCH-16],
+    [BIZ-20]), PDF rendering and upload to object storage ([BIZ-21]), where the event details printed
+    on the PDF come from, which events a gate-staff member may scan (**TODO** [ARCH-03]), the time
+    window in which a ticket is admitted (e.g. only on the event day; not defined), whether a scanned
+    ticket can still be refunded (**TODO** [BIZ-29]), offline scanning, scan latency targets (**TODO**
+    [OPS-05]), health endpoints (outside `/api/v1`, [API-10]).
+
+servers:
+  - url: /api/v1
+    description: Version 1 of the API, mounted once ([API-10]).
+
+security:
+  - bearerAuth: [customer]
+
+tags:
+  - name: Tickets
+    description: Tickets issued for the seats of paid orders ([BIZ-25]), with their PDF document.
+  - name: Scans
+    description: Validation of tickets at the venue entrance ([BIZ-26]).
+
+paths:
+  /tickets:
+    get:
+      operationId: listTickets
+      tags: [Tickets]
+      summary: List the caller's tickets
+      description: |
+        Customer operation. Returns one page of the caller's tickets, newest first by default.
+        Filters: `orderId`, `eventId`. Sort fields: `issuedAt` (whitelist, [API-35]); ties are broken
+        by ascending ticket `id`.
+      parameters:
+        - name: orderId
+          in: query
+          required: false
+          description: Return only the tickets of this order.
+          schema:
+            $ref: '#/components/schemas/OrderId'
+          example: 5512
+        - name: eventId
+          in: query
+          required: false
+          description: Return only the tickets for this event.
+          schema:
+            $ref: '#/components/schemas/EventId'
+          example: 413
+        - name: sort
+          in: query
+          required: false
+          description: Sort field; a leading `-` sorts descending. A cursor is bound to the sort it was issued for.
+          schema:
+            type: string
+            enum: [issuedAt, -issuedAt]
+            default: -issuedAt
+          example: -issuedAt
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: One page of tickets.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketPage'
+              example:
+                items:
+                  - id: 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c
+                    orderId: 5512
+                    eventId: 413
+                    seat:
+                      id: 9001
+                      label: A13
+                      sector: Stalls
+                    status: VALID
+                    documentReady: true
+                    issuedAt: '2029-09-01T20:54:30+02:00'
+                    scannedAt: null
+                    revokedAt: null
+                  - id: 8a7d6c5b-4e3f-4a2b-9c1d-0e9f8a7b6c5d
+                    orderId: 5512
+                    eventId: 413
+                    seat:
+                      id: 9002
+                      label: A14
+                      sector: Stalls
+                    status: VALID
+                    documentReady: false
+                    issuedAt: '2029-09-01T20:54:30+02:00'
+                    scannedAt: null
+                    revokedAt: null
+                nextCursor: null
+                limit: 50
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /tickets/{ticketId}:
+    get:
+      operationId: getTicket
+      tags: [Tickets]
+      summary: Get a ticket or its PDF document
+      description: |
+        Customer operation. Returns one of the caller's tickets; another customer's ticket answers
+        `404` ([API-18]). The representation is chosen with `Accept` ([API-41], [API-43]):
+
+        - `application/json`: the ticket metadata, with an `ETag`; `If-None-Match` answers `304` when
+          the ticket is unchanged.
+        - `application/pdf`: the ticket document, streamed by Ticketing from object storage
+          ([ARCH-19]), which is never exposed to clients. While the PDF is not rendered yet
+          (`documentReady` is `false`, [BIZ-21]) the request fails with `409 TICKET_DOCUMENT_NOT_READY`.
+          A REVOKED ticket's document is still served, as a record of the purchase.
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The ticket metadata or its PDF document, as negotiated.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Content-Disposition:
+              $ref: '#/components/headers/ContentDisposition'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+              example:
+                id: 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c
+                orderId: 5512
+                eventId: 413
+                seat:
+                  id: 9001
+                  label: A13
+                  sector: Stalls
+                status: VALID
+                documentReady: true
+                issuedAt: '2029-09-01T20:54:30+02:00'
+                scannedAt: null
+                revokedAt: null
+            application/pdf:
+              schema:
+                $ref: '#/components/schemas/TicketDocument'
+              example: '%PDF-1.7 … (binary ticket document)'
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: The PDF document is not rendered yet; retry later.
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: /problems/ticket-document-not-ready
+                title: Ticket document not ready
+                status: 409
+                detail: The document of ticket 8a7d6c5b-4e3f-4a2b-9c1d-0e9f8a7b6c5d is not ready yet; retry later.
+                instance: /api/v1/tickets/8a7d6c5b-4e3f-4a2b-9c1d-0e9f8a7b6c5d
+                code: TICKET_DOCUMENT_NOT_READY
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /tickets/{ticketId}/scans:
+    post:
+      operationId: scanTicket
+      tags: [Scans]
+      summary: Scan a ticket at the entrance
+      description: |
+        Gate-staff operation. Validates the ticket read from the QR code against the event the gate
+        serves, and admits it if valid. Built to answer fast: one lookup by ticket id and one
+        conditional update.
+
+        - First scan of a VALID ticket for this event: the ticket becomes SCANNED and the admission is
+          recorded: `201`, admit ([BIZ-26]). Of several concurrent scans of the same ticket, exactly
+          one is admitted.
+        - Later scans: `409 TICKET_ALREADY_SCANNED`, always with the same body, carrying the admitting
+          scan (`firstScan`) so staff can see when and where the ticket entered ([BIZ-26]). State does
+          not change.
+        - REVOKED ticket (order refunded): `409 TICKET_REVOKED`, refuse.
+        - Ticket for another event: `422 TICKET_WRONG_EVENT`, refuse.
+        - Unknown ticket id (e.g. a forged QR code): `404 TICKET_NOT_FOUND`, refuse.
+
+        `Idempotency-Key` is required so that a scanner retrying after a lost response gets the
+        original `201` replayed, not a misleading `409 TICKET_ALREADY_SCANNED` for a ticket it has just
+        admitted. A new physical scan uses a new key.
+
+        **TODO** [ARCH-03]: which events a gate-staff member may scan is still to be defined; this draft
+        accepts any `gate-staff` token.
+      security:
+        - bearerAuth: [gate-staff]
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        description: The event the gate serves and, optionally, the gate.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScanCreate'
+            example:
+              eventId: 413
+              gate: North 2
+      responses:
+        '201':
+          description: Admit. The ticket was VALID for this event and is now SCANNED.
+          headers:
+            Location:
+              $ref: '#/components/headers/ScanLocation'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Scan'
+              example:
+                id: 70411
+                ticketId: 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c
+                eventId: 413
+                seat:
+                  id: 9001
+                  label: A13
+                  sector: Stalls
+                gate: North 2
+                scannedAt: '2029-09-01T20:58:12+02:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/GateStaffForbidden'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '409':
+          description: Refuse. The ticket was already scanned or is revoked; or the same request is still executing.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/AlreadyScannedProblem'
+                  - $ref: '#/components/schemas/Problem'
+              examples:
+                alreadyScanned:
+                  summary: The ticket was already admitted
+                  value:
+                    type: /problems/ticket-already-scanned
+                    title: Ticket already scanned
+                    status: 409
+                    detail: Ticket 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c was already scanned at 2029-09-01T20:58:12+02:00.
+                    instance: /api/v1/tickets/3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c/scans
+                    code: TICKET_ALREADY_SCANNED
+                    firstScan:
+                      id: 70411
+                      ticketId: 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c
+                      eventId: 413
+                      seat:
+                        id: 9001
+                        label: A13
+                        sector: Stalls
+                      gate: North 2
+                      scannedAt: '2029-09-01T20:58:12+02:00'
+                revoked:
+                  summary: The ticket's order was refunded
+                  value:
+                    type: /problems/ticket-revoked
+                    title: Ticket revoked
+                    status: 409
+                    detail: Ticket 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c was revoked; its order was refunded.
+                    instance: /api/v1/tickets/3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c/scans
+                    code: TICKET_REVOKED
+                idempotencyKeyInUse:
+                  $ref: '#/components/examples/IdempotencyKeyInUse'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          description: Refuse, or invalid body. The ticket is for another event, the body is invalid, or the idempotency key was reused.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                wrongEvent:
+                  summary: The ticket is for another event
+                  value:
+                    type: /problems/ticket-wrong-event
+                    title: Ticket for another event
+                    status: 422
+                    detail: Ticket 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c is for event 413, not 418.
+                    instance: /api/v1/tickets/3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c/scans
+                    code: TICKET_WRONG_EVENT
+                validationFailed:
+                  summary: A field is missing or invalid
+                  value:
+                    type: /problems/validation-failed
+                    title: Validation failed
+                    status: 422
+                    detail: The request body has invalid fields.
+                    instance: /api/v1/tickets/3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c/scans
+                    code: VALIDATION_FAILED
+                    errors:
+                      - field: eventId
+                        code: REQUIRED
+                        detail: Must be the event the gate serves.
+                idempotencyKeyReused:
+                  $ref: '#/components/examples/IdempotencyKeyReused'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /tickets/{ticketId}/scans/{scanId}:
+    get:
+      operationId: getTicketScan
+      tags: [Scans]
+      summary: Get the admitting scan of a ticket
+      description: |
+        Gate-staff operation. Returns a recorded admission, the resource created by a `201` of
+        `scanTicket`.
+      security:
+        - bearerAuth: [gate-staff]
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+        - $ref: '#/components/parameters/ScanId'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The scan.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Scan'
+              example:
+                id: 70411
+                ticketId: 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c
+                eventId: 413
+                seat:
+                  id: 9001
+                  label: A13
+                  sector: Stalls
+                gate: North 2
+                scannedAt: '2029-09-01T20:58:12+02:00'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/GateStaffForbidden'
+        '404':
+          description: The ticket or the scan does not exist.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: /problems/scan-not-found
+                title: Scan not found
+                status: 404
+                detail: Ticket 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c has no scan 70499.
+                instance: /api/v1/tickets/3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c/scans/70499
+                code: SCAN_NOT_FOUND
+        '406':
+          $ref: '#/components/responses/NotAcceptable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Keycloak-issued access token, verified by signature on every request ([SEC-02], [SEC-03]).
+        Security requirements list the Keycloak role the operation requires: `customer`, `organizer`
+        or `gate-staff` ([ARCH-30]).
+
+  parameters:
+    TicketId:
+      name: ticketId
+      in: path
+      required: true
+      description: Identifier of the ticket, as encoded in its QR code.
+      schema:
+        $ref: '#/components/schemas/TicketId'
+      example: 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c
+    ScanId:
+      name: scanId
+      in: path
+      required: true
+      description: Identifier of the scan.
+      schema:
+        $ref: '#/components/schemas/ScanId'
+      example: 70411
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Requested page size; the server clamps it to 200 and echoes the served value in `limit`.
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        default: 50
+      example: 50
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from the `nextCursor` of the previous page; omit it for the first page. Never parse or build it.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+      example: MjAyOS0wOS0wMXwzZjJi
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID identifying one logical operation, reused on every retry of it ([API-24]); retained for 24 hours.
+      schema:
+        type: string
+        format: uuid
+      example: 5f0c1c1e-3f4b-4f43-9d7e-2b8a3c7d9e10
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: ETag of the JSON representation held by the client; the server answers 304 if it still matches.
+      schema:
+        type: string
+      example: '"v1"'
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Correlation id of the request; generated by the server when absent and returned on the response ([OPS-12]).
+      schema:
+        type: string
+        maxLength: 128
+      example: 0b6f3c4e-8a2d-4c1f-9e7b-5d3a2f1c0e9d
+
+  headers:
+    RequestId:
+      description: Correlation id of the request, reused from the request or generated ([OPS-12]).
+      schema:
+        type: string
+      example: 0b6f3c4e-8a2d-4c1f-9e7b-5d3a2f1c0e9d
+    ETag:
+      description: Strong entity tag carrying the row version of the ticket; sent with the JSON representation only.
+      schema:
+        type: string
+      example: '"v1"'
+    ContentDisposition:
+      description: Sent with the PDF representation only; suggests a file name for the download.
+      schema:
+        type: string
+      example: inline; filename="ticket-3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c.pdf"
+    ScanLocation:
+      description: URI of the recorded admission ([API-17]).
+      schema:
+        type: string
+        format: uri-reference
+      example: /api/v1/tickets/3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c/scans/70411
+    CacheControlNoStore:
+      description: The response must not be stored by any cache ([API-30]).
+      schema:
+        type: string
+        const: no-store
+      example: no-store
+    RetryAfter:
+      description: Seconds the client should wait before retrying, with backoff ([API-46]).
+      schema:
+        type: integer
+        minimum: 0
+      example: 5
+
+  schemas:
+    TicketId:
+      description: Identifier of a ticket, a random UUID (version 4) that is unguessable and carried by the ticket's QR code.
+      type: string
+      format: uuid
+    ScanId:
+      description: Identifier of a recorded admission.
+      type: integer
+      format: int64
+      minimum: 1
+    OrderId:
+      description: Identifier of an order, assigned by Inventory & Orders.
+      type: integer
+      format: int64
+      minimum: 1
+    EventId:
+      description: Identifier of an event, assigned by Catalogue.
+      type: integer
+      format: int64
+      minimum: 1
+    SeatId:
+      description: Identifier of a seat in the inventory of an event, assigned by Inventory & Orders.
+      type: integer
+      format: int64
+      minimum: 1
+
+    Timestamp:
+      description: ISO 8601 timestamp with an explicit UTC offset ([API-05]).
+      type: string
+      format: date-time
+
+    SeatRef:
+      description: Identification of the seat the ticket admits to, as in Inventory & Orders.
+      type: object
+      required: [id, label, sector]
+      properties:
+        id:
+          $ref: '#/components/schemas/SeatId'
+        label:
+          description: Human-readable seat label printed on the ticket, carrying row and seat number (e.g. `A13`).
+          type: string
+        sector:
+          description: Venue sector of the seat.
+          type: string
+
+    TicketStatus:
+      description: |
+        State of a ticket. VALID admits on its first scan; SCANNED was admitted ([BIZ-26]); REVOKED
+        belongs to a refunded order and is refused. Only VALID -> SCANNED and VALID -> REVOKED are
+        legal.
+      type: string
+      enum: [VALID, SCANNED, REVOKED]
+
+    Ticket:
+      description: Ticket issued for one seat of a paid order ([BIZ-25]).
+      type: object
+      required: [id, orderId, eventId, seat, status, documentReady, issuedAt, scannedAt, revokedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/TicketId'
+        orderId:
+          $ref: '#/components/schemas/OrderId'
+        eventId:
+          $ref: '#/components/schemas/EventId'
+        seat:
+          $ref: '#/components/schemas/SeatRef'
+        status:
+          $ref: '#/components/schemas/TicketStatus'
+        documentReady:
+          description: Whether the PDF document is rendered and can be downloaded ([BIZ-21]).
+          type: boolean
+        issuedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the ticket was issued.
+        scannedAt:
+          description: When the ticket was admitted; `null` unless SCANNED.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        revokedAt:
+          description: When the ticket was revoked; `null` unless REVOKED.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+
+    TicketDocument:
+      description: The ticket's PDF document, carrying the QR code that encodes the ticket `id`.
+      type: string
+      format: binary
+
+    TicketPage:
+      description: One page of tickets.
+      type: object
+      required: [items, nextCursor, limit]
+      properties:
+        items:
+          description: Tickets of this page, in the requested sort order.
+          type: array
+          items:
+            $ref: '#/components/schemas/Ticket'
+        nextCursor:
+          description: Cursor of the next page; `null` on the last page.
+          type: [string, 'null']
+        limit:
+          description: Page size served after clamping.
+          type: integer
+          format: int32
+
+    ScanCreate:
+      description: Request to validate a ticket at a gate.
+      type: object
+      additionalProperties: false
+      required: [eventId]
+      properties:
+        eventId:
+          $ref: '#/components/schemas/EventId'
+          description: Event the gate serves; a ticket for another event is refused.
+        gate:
+          description: Optional label of the entrance, recorded with the admission.
+          type: string
+          minLength: 1
+          maxLength: 50
+
+    Scan:
+      description: A recorded admission of a ticket at the entrance.
+      type: object
+      required: [id, ticketId, eventId, seat, gate, scannedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/ScanId'
+        ticketId:
+          $ref: '#/components/schemas/TicketId'
+        eventId:
+          $ref: '#/components/schemas/EventId'
+        seat:
+          $ref: '#/components/schemas/SeatRef'
+        gate:
+          description: Entrance where the ticket was admitted; `null` if the scanner sent none.
+          type: [string, 'null']
+        scannedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the ticket was admitted.
+
+    FieldError:
+      description: One invalid field of a request ([STY-20]).
+      type: object
+      required: [field, code, detail]
+      properties:
+        field:
+          description: Path of the invalid field, e.g. `eventId`.
+          type: string
+        code:
+          description: Stable validation code, e.g. `REQUIRED`, `INVALID_FORMAT`, `OUT_OF_RANGE`.
+          type: string
+        detail:
+          description: Human-readable explanation.
+          type: string
+
+    Problem:
+      description: |
+        RFC 9457 problem document, the single error format of the platform ([API-04]). `code` is a
+        stable machine-readable identifier that never changes once published ([STY-79]).
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type:
+          description: URI reference identifying the problem type.
+          type: string
+          format: uri-reference
+        title:
+          description: Short human-readable summary of the problem type.
+          type: string
+        status:
+          description: HTTP status code of the response.
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          description: Human-readable explanation of this occurrence.
+          type: string
+        instance:
+          description: URI reference of the request that produced the problem.
+          type: string
+          format: uri-reference
+        code:
+          description: Stable error code.
+          type: string
+        errors:
+          description: Field errors; present on validation failures.
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+    AlreadyScannedProblem:
+      description: Problem document of `TICKET_ALREADY_SCANNED`, extended with the admitting scan; identical on every later scan ([BIZ-26]).
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          required: [firstScan]
+          properties:
+            firstScan:
+              $ref: '#/components/schemas/Scan'
+              description: The scan that admitted the ticket.
+
+  examples:
+    IdempotencyKeyInUse:
+      summary: A request with the same Idempotency-Key is still executing
+      value:
+        type: /problems/idempotency-key-in-use
+        title: Idempotency key in use
+        status: 409
+        detail: A request with this Idempotency-Key is still being processed; retry later.
+        instance: /api/v1/tickets/3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c/scans
+        code: IDEMPOTENCY_KEY_IN_USE
+    IdempotencyKeyReused:
+      summary: The Idempotency-Key was used for a different request
+      value:
+        type: /problems/idempotency-key-reused
+        title: Idempotency key reused
+        status: 422
+        detail: This Idempotency-Key was already used with a different request.
+        instance: /api/v1/tickets/3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c/scans
+        code: IDEMPOTENCY_KEY_REUSED
+
+  responses:
+    NotModified:
+      description: The JSON representation is unchanged since the ETag sent in `If-None-Match`; empty body ([API-32]).
+      headers:
+        ETag:
+          $ref: '#/components/headers/ETag'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+    BadRequest:
+      description: The request cannot be parsed (malformed JSON, ticket id that is not a UUID, wrong parameter type, invalid cursor).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/malformed-request
+            title: Malformed request
+            status: 400
+            detail: Path parameter ticketId must be a UUID.
+            instance: /api/v1/tickets/not-a-ticket/scans
+            code: MALFORMED_REQUEST
+    Unauthorized:
+      description: The bearer token is missing or invalid ([SEC-06]).
+      headers:
+        WWW-Authenticate:
+          description: Authentication challenge for the bearer scheme.
+          schema:
+            type: string
+          example: Bearer
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/unauthenticated
+            title: Unauthenticated
+            status: 401
+            detail: A valid bearer token is required.
+            instance: /api/v1/tickets
+            code: UNAUTHENTICATED
+    Forbidden:
+      description: The caller is authenticated but lacks the role the operation requires ([SEC-06]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/forbidden
+            title: Forbidden
+            status: 403
+            detail: This operation requires the customer role.
+            instance: /api/v1/tickets
+            code: FORBIDDEN
+    GateStaffForbidden:
+      description: The caller is authenticated but lacks the `gate-staff` role ([SEC-06]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/forbidden
+            title: Forbidden
+            status: 403
+            detail: This operation requires the gate-staff role.
+            instance: /api/v1/tickets/3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c/scans
+            code: FORBIDDEN
+    TicketNotFound:
+      description: The ticket does not exist, or (for customers) belongs to another customer ([API-18]). At the gate this means refuse.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/ticket-not-found
+            title: Ticket not found
+            status: 404
+            detail: Ticket 3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c does not exist.
+            instance: /api/v1/tickets/3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c
+            code: TICKET_NOT_FOUND
+    NotAcceptable:
+      description: The `Accept` header allows no media type this operation produces ([API-43]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/not-acceptable
+            title: Not acceptable
+            status: 406
+            detail: This operation produces application/json or application/pdf.
+            instance: /api/v1/tickets/3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c
+            code: NOT_ACCEPTABLE
+    UnsupportedMediaType:
+      description: The `Content-Type` of the body is not accepted by this operation ([API-43]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/unsupported-media-type
+            title: Unsupported media type
+            status: 415
+            detail: This operation consumes application/json.
+            instance: /api/v1/tickets/3f2b8c1e-9a4d-4e7f-b6c5-1d2e3f4a5b6c/scans
+            code: UNSUPPORTED_MEDIA_TYPE
+    TooManyRequests:
+      description: The caller exceeded its rate limit; retry after `Retry-After` seconds ([API-18], [API-46]).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/rate-limited
+            title: Too many requests
+            status: 429
+            detail: Rate limit exceeded; retry later.
+            instance: /api/v1/tickets
+            code: RATE_LIMITED
+    InternalServerError:
+      description: Unexpected server failure; details are logged with the correlation id, not returned ([OPS-17]).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/internal-error
+            title: Internal server error
+            status: 500
+            detail: An unexpected error occurred.
+            instance: /api/v1/tickets
+            code: INTERNAL_ERROR
+    ServiceUnavailable:
+      description: The service is shedding load, or its database or object storage is unavailable; retry after `Retry-After` seconds ([API-19], [OPS-02]).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/service-unavailable
+            title: Service unavailable
+            status: 503
+            detail: The service is overloaded; retry later.
+            instance: /api/v1/tickets
+            code: SERVICE_UNAVAILABLE
