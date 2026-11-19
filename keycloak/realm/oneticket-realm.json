@@ -1,0 +1,31 @@
+{
+  "realm": "oneticket",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "roles": {
+    "realm": [
+      { "name": "customer", "description": "Can browse and purchase tickets" },
+      { "name": "organizer", "description": "Can manage owned events and venues" },
+      { "name": "gate-staff", "description": "Can validate tickets at an event entrance" },
+      { "name": "service", "description": "Used by authenticated service-to-service calls" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "oneticket-spa",
+      "name": "OneTicket SPA",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["http://localhost:3000/*"],
+      "webOrigins": ["http://localhost:3000"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      }
+    }
+  ]
+}
