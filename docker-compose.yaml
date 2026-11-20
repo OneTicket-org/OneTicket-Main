@@ -41,6 +41,22 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  payments:
+    build:
+      context: ./services/payments
+      dockerfile: Dockerfile
+    environment:
+      SERVER_PORT: "8082"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payments_db
+      SPRING_DATASOURCE_USERNAME: payments
+      SPRING_DATASOURCE_PASSWORD: ${PAYMENTS_DB_PASSWORD:?Set PAYMENTS_DB_PASSWORD in .env}
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    
   keycloak:
     image: keycloak/keycloak:26.7
     command: ["start-dev", "--import-realm"]
