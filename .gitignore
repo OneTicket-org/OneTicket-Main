@@ -1,5 +1,5 @@
-# Local environment variables and credentials
+# Local credentials and developer-only Compose overrides
 .env
 .env.*
 !.env.example
-
+docker-compose.local.yaml
