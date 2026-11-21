@@ -25,6 +25,17 @@ services:
       retries: 20
     restart: unless-stopped
 
+  adminer:
+    image: adminer:latest
+    profiles: ["tools"]
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    ports:
+      - "8090:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   catalogue:
     build:
       context: ./services/catalogue
