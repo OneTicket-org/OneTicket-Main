@@ -1,0 +1,17 @@
+# Copy this file to docker-compose.local.yaml for local builds from sibling
+# service repository checkouts. Edit the contexts if your checkout layout differs.
+services:
+  catalogue:
+    build:
+      context: ../OneTicket-Catalogue
+      dockerfile: Dockerfile
+
+  payments:
+    build:
+      context: ../OneTicket-Payments
+      dockerfile: Dockerfile
+
+  notifications:
+    build:
+      context: ../OneTicket-Notifications
+      dockerfile: Dockerfile

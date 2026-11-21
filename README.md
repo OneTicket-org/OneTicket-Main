@@ -21,3 +21,7 @@ git clone --recurse-submodules git@github.com:OneTicket-org/OneTicket-main.git
 ```
 
 In an existing clone, run `git submodule update --init`. Submodules are pinned to a commit. A merge to a service's `main` moves its pointer automatically: the service's `notify-main.yml` workflow triggers [`update-submodules.yml`](.github/workflows/update-submodules.yml) here, which commits the new pointer. To test against the latest code locally, run `git submodule update --remote` and don't commit the resulting pointer changes.
+
+## Local Docker environment
+
+See [docs/docker.md](docs/docker.md) for setup, full-stack and single-service commands, Adminer, local ports, and credentials.
